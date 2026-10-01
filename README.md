@@ -274,7 +274,8 @@ Requires Java 17+.
 
 `.github/workflows/keycloak-compat.yml` runs daily. When Maven Central has a final Keycloak
 release newer than `keycloak.version` in `pom.xml`, it runs `ci/kc-compat/run-all.sh` and
-opens an issue titled `[kc-compat] Keycloak <version> – Kompatibilitätscheck` with the result.
+opens an issue titled `[kc-compat] Keycloak <version> – Kompatibilitätscheck` with the result,
+links to the upgrading guide and release notes, and the source diffs of our superclasses.
 Each version is reported once. Delete the issue or start the workflow manually (optionally with
 explicit versions) to check it again.
 
@@ -284,7 +285,7 @@ explicit versions) to check it again.
 | Build + unit tests against the new version | compilation or a test fails |
 | Bytecode old vs. new | — (warns if the classes differ, i.e. the rebuilt jar should be rolled out) |
 | Third-party libraries | — (warns on a minor/major bump of a library we import directly, e.g. webauthn4j) |
-| API/linkage diff of every Keycloak type we use or extend | a referenced method/field/class is gone, an override no longer overrides, or a new abstract method appears; warns and attaches source diffs for every changed class, superclasses first |
+| API/linkage diff of every Keycloak type we use or extend | a referenced method/field/class is gone, an override no longer overrides, or a new abstract method appears; warns and attaches source diffs for every changed class, superclasses first, and lists where Keycloak itself calls methods newly added to our superclasses (e.g. new security checks) |
 | Start Keycloak with the **old** jar | startup fails, a provider is not registered, configuring it via the admin API fails, the protocol mapper does not produce the expected claim, or the log contains `ERROR` lines |
 | Start Keycloak with the **rebuilt** jar | same as above |
 
