@@ -270,6 +270,37 @@ RUN /opt/keycloak/bin/kc.sh build
 
 Requires Java 17+.
 
+### Automatic check against new Keycloak releases
+
+`.github/workflows/keycloak-compat.yml` runs daily. When Maven Central has a final Keycloak
+release newer than `keycloak.version` in `pom.xml`, it runs `ci/kc-compat/run-all.sh` and
+opens an issue titled `[kc-compat] Keycloak <version> – Kompatibilitätscheck` with the result.
+Each version is reported once. Delete the issue or start the workflow manually (optionally with
+explicit versions) to check it again.
+
+| Check | Fails when |
+|---|---|
+| Build the "old" jar against the baseline version | the baseline no longer builds |
+| Build + unit tests against the new version | compilation or a test fails |
+| Bytecode old vs. new | — (warns if the classes differ, i.e. the rebuilt jar should be rolled out) |
+| Third-party libraries | — (warns on a minor/major bump of a library we import directly, e.g. webauthn4j) |
+| API/linkage diff of every Keycloak type we use or extend | a referenced method/field/class is gone, an override no longer overrides, or a new abstract method appears; warns and attaches source diffs for every changed class, superclasses first |
+| Start Keycloak with the **old** jar | startup fails, a provider is not registered, configuring it via the admin API fails, the protocol mapper does not produce the expected claim, or the log contains `ERROR` lines |
+| Start Keycloak with the **rebuilt** jar | same as above |
+
+Keycloak is started from the official server distribution (`org.keycloak:keycloak-quarkus-dist`)
+rather than the container image, so the check needs no Docker and runs locally the same way:
+
+```bash
+ci/kc-compat/run-all.sh                 # newest release vs. pom baseline
+ci/kc-compat/run-all.sh 26.8.0 26.7.4   # explicit versions
+OLD_JAR=dist/my.jar ci/kc-compat/run-all.sh   # use the jar that is actually deployed
+```
+
+Requires Java 21+, Maven and Python 3. The report ends up in `.kc-compat/report.md`. Add new
+providers to `ci/kc-compat/expected-providers.txt`; the check fails if its count does not match
+`META-INF/services`.
+
 ---
 
 ## License

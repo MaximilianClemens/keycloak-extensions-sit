@@ -6,3 +6,4 @@ settings.xml
 *.iml
 .idea/
 .DS_Store
+.kc-compat/
