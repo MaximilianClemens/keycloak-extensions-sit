@@ -7,3 +7,4 @@ settings.xml
 .idea/
 .DS_Store
 .kc-compat/
+__pycache__/
