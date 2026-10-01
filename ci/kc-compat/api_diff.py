@@ -17,8 +17,10 @@ Vorgehen:
        - Abstrakt:  Sind neue abstrakte Methoden in Typen dazugekommen, die wir erweitern?
        - API:       Hinzugefügte/entfernte public/protected Member.
        - Quelltext: Diff der Sources (Verhaltensänderungen ohne Signaturänderung).
+       - Aufrufer:  Neue Methoden in unseren Oberklassen und wo Keycloak sie selbst aufruft.
 
-Ergebnis: Markdown-Report auf stdout bzw. in --report, Kurzfassung in --summary.
+Ergebnis: Markdown-Report auf stdout bzw. in --report, kompakte Issue-Fassung in --issue,
+Statuszeile in --status.
 Exit-Code 1 bei Linkage-/Override-Problemen, sonst 0.
 """
 import argparse
@@ -181,6 +183,17 @@ class ClassPath:
         if not jar:
             return None
         return self._zip(jar).read(top).decode("utf-8", "replace").splitlines()
+
+    def callers_of(self, method, exclude=None):
+        """Quelltextdateien in org/keycloak, die `method(` aufrufen (grobe Textsuche)."""
+        if not hasattr(self, "_texts"):
+            self._texts = {}
+            for path, jar in self.sources.items():
+                if path.startswith(WATCH_PREFIX):
+                    self._texts[path] = self._zip(jar).read(path).decode("utf-8", "replace")
+        needle = method + "("
+        return sorted(p[:-5].replace("/", ".") for p, text in self._texts.items()
+                      if p != exclude and needle in text)
 
     def supertypes(self, name):
         """Alle Ober-Typen (Klassen und Interfaces) innerhalb des Klassenpfads, inkl. name."""
@@ -360,10 +373,81 @@ def analyse(own, old, new):
         if notes or diff:
             findings[t] = (notes, diff)
 
-    return relevant, inherited, problems, findings
+    # 6. Neue Methoden in Oberklassen: Wer in Keycloak ruft sie auf? Neue Hilfsmethoden in einer
+    #    Basisklasse sind oft neue Sicherheits- oder Validierungsschritte, die Keycloaks eigene
+    #    Unterklassen übernehmen - unsere aber nicht automatisch.
+    callers = {}
+    for t in sorted(inherited):
+        oc, nc = old.get(t), new.get(t)
+        if not oc or not nc:
+            continue
+        added = sorted({name for (name, desc), acc in nc.methods.items()
+                        if is_api(acc) and (name, desc) not in oc.methods and not name.startswith("<")})
+        for name in added:
+            hits = new.callers_of(name, exclude=t.split("$", 1)[0] + ".java")
+            callers.setdefault(t, []).append((name, hits))
+
+    return relevant, inherited, problems, findings, callers
 
 
-def render(old_v, new_v, relevant, inherited, problems, findings):
+def render_callers(callers, limit=12):
+    lines = []
+    for t, items in callers.items():
+        for name, hits in items:
+            if not hits:
+                continue
+            shown = ", ".join("`%s`" % h.rsplit(".", 1)[-1] for h in hits[:limit])
+            more = " und %d weitere" % (len(hits) - limit) if len(hits) > limit else ""
+            lines.append("- `%s#%s()` ist neu und wird in Keycloak aufgerufen von: %s%s"
+                         % (dotted(t).rsplit(".", 1)[-1], name, shown, more))
+    if not lines:
+        return []
+    return (["### 🔎 Neue Methoden in unseren Oberklassen", "",
+             "Keycloak hat sie eingeführt und nutzt sie in eigenen Klassen - prüfen, ob unsere "
+             "Unterklassen sie ebenfalls aufrufen sollten (z. B. neue Sicherheitsprüfungen).", ""]
+            + lines + [""])
+
+
+def render_issue(old_v, new_v, relevant, inherited, problems, findings, callers, budget=42000):
+    """Kompakte Fassung für das Issue: alles zu Oberklassen inkl. Diffs, Rest nur als Tabelle."""
+    lines = []
+    if problems:
+        lines += ["### ❌ Inkompatibilitäten (alte Jars brechen zur Laufzeit)", ""]
+        lines += ["- " + p for p in problems] + [""]
+    lines += render_callers(callers)
+    if findings:
+        lines += ["### Geänderte Keycloak-Klassen", "",
+                  "| Bezug | Klasse | API-Änderungen | Quelltext-Diff |", "|---|---|---|---|"]
+        for t, (notes, diff) in findings.items():
+            changed = sum(1 for d in diff[2:] if d[:1] in "+-") if diff else 0
+            lines.append("| %s | `%s` | %d | %s |" % ("**erbt**" if t in inherited else "verwendet", dotted(t),
+                                                   len(notes), ("%d Zeilen" % changed) if diff else "-"))
+        lines.append("")
+        size = sum(len(l) + 1 for l in lines)
+        skipped = []
+        for t, (notes, diff) in findings.items():
+            if t not in inherited:
+                continue
+            block = ["<details><summary>Änderungen in <code>%s</code></summary>" % dotted(t), ""]
+            block += ["- " + n for n in notes]
+            if diff:
+                block += ["", "```diff"] + diff[:250]
+                if len(diff) > 250:
+                    block.append("... (%d weitere Zeilen im Artefakt)" % (len(diff) - 250))
+                block.append("```")
+            block += ["", "</details>", ""]
+            block_size = sum(len(l) + 1 for l in block)
+            if size + block_size > budget:
+                skipped.append(dotted(t))
+                continue
+            lines += block
+            size += block_size
+        if skipped:
+            lines += ["Diffs für %s passen nicht ins Issue, siehe Artefakt." % ", ".join("`%s`" % x for x in skipped), ""]
+    return "\n".join(lines) + "\n"
+
+
+def render(old_v, new_v, relevant, inherited, problems, findings, callers):
     lines = ["## API-Vergleich Keycloak %s → %s" % (old_v, new_v), ""]
     lines.append("Geprüft: **%d** Keycloak-Typen, die unser Code benutzt oder von denen er erbt." % len(relevant))
     lines.append("")
@@ -375,6 +459,7 @@ def render(old_v, new_v, relevant, inherited, problems, findings):
     else:
         lines.append("✅ Alle referenzierten Methoden/Felder existieren weiter, alle Overrides greifen weiter.")
         lines.append("")
+    lines += render_callers(callers, limit=50)
     if findings:
         lines.append("### ⚠️ Geänderte Klassen (Verhalten prüfen)")
         lines.append("")
@@ -425,15 +510,19 @@ def main():
     ap.add_argument("--new-sources")
     ap.add_argument("--report", help="Markdown-Report schreiben")
     ap.add_argument("--status", help="Statuszeile (STATUS<TAB>Text) schreiben")
+    ap.add_argument("--issue", help="kompakte Fassung für das GitHub-Issue schreiben")
     args = ap.parse_args()
 
     own = load_own_classes(args.classes)
     old = ClassPath(args.old_jars, args.old_sources)
     new = ClassPath(args.new_jars, args.new_sources)
-    relevant, inherited, problems, findings = analyse(own, old, new)
+    relevant, inherited, problems, findings, callers = analyse(own, old, new)
     # Klassen, von denen wir erben, zuerst
     findings = dict(sorted(findings.items(), key=lambda kv: (kv[0] not in inherited, kv[0])))
-    md = render(args.old_version, args.new_version, relevant, inherited, problems, findings)
+    md = render(args.old_version, args.new_version, relevant, inherited, problems, findings, callers)
+    if args.issue:
+        with open(args.issue, "w") as fh:
+            fh.write(render_issue(args.old_version, args.new_version, relevant, inherited, problems, findings, callers))
 
     if args.report:
         with open(args.report, "w") as fh:

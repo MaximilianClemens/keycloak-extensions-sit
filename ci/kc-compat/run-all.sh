@@ -37,7 +37,7 @@ export MVN
 NEW_VERSION="${1:-$("$SCRIPT_DIR/latest-version.sh")}"
 BASE_VERSION="${2:-$(sed -n 's:.*<keycloak.version>\(.*\)</keycloak.version>.*:\1:p' pom.xml | head -n 1)}"
 
-rm -rf "$WORK_DIR/report" "$WORK_DIR"/smoke-*.{out,status,log} "$WORK_DIR/results.tsv"
+rm -rf "$WORK_DIR/report" "$WORK_DIR"/smoke-*.{out,status,log} "$WORK_DIR/results.tsv" "$WORK_DIR/api-issue.md"
 mkdir -p "$WORK_DIR/report" "$WORK_DIR/jars"
 RESULTS="$WORK_DIR/results.tsv"
 : > "$RESULTS"
@@ -183,7 +183,7 @@ if [ -d "$WORK_DIR/classes-old" ] && fetch_kc "$BASE_VERSION" && fetch_kc "$NEW_
     --classes "$WORK_DIR/classes-old" \
     --old-version "$BASE_VERSION" --old-jars "$WORK_DIR/deps-$BASE_VERSION/jars" --old-sources "$WORK_DIR/deps-$BASE_VERSION/sources" \
     --new-version "$NEW_VERSION" --new-jars "$WORK_DIR/deps-$NEW_VERSION/jars" --new-sources "$WORK_DIR/deps-$NEW_VERSION/sources" \
-    --report "$WORK_DIR/report/05-api.md" --status "$WORK_DIR/api.status" 2>/dev/null
+    --report "$WORK_DIR/report/05-api.md" --issue "$WORK_DIR/api-issue.md" --status "$WORK_DIR/api.status" 2>/dev/null
   IFS=$'\t' read -r st txt < "$WORK_DIR/api.status"
   result 05 "API-/Linkage-Vergleich" "$st" "$txt"
 else
@@ -216,6 +216,8 @@ grep -q $'\tFAIL\t' "$RESULTS" && overall=FAIL
   echo
   echo "Basis: **$BASE_VERSION** (\`keycloak.version\` in pom.xml) · Neu: **$NEW_VERSION** · Gesamt: $(icon $overall) **$overall**"
   echo
+  echo "Release-Infos: [Upgrading Guide $NEW_VERSION](https://www.keycloak.org/docs/$NEW_VERSION/upgrading/) · [Release Notes auf GitHub](https://github.com/keycloak/keycloak/releases/tag/$NEW_VERSION)"
+  echo
   echo "| | Prüfung | Ergebnis |"
   echo "|---|---|---|"
   sort "$RESULTS" | while IFS=$'\t' read -r _ title st txt; do
@@ -237,25 +239,20 @@ grep -q $'\tFAIL\t' "$RESULTS" && overall=FAIL
   done
 } > "$WORK_DIR/report.md"
 
-# Kompakte Fassung für GitHub-Issues (Body-Limit 65536 Zeichen): ohne Quelltext-Diffs
+# Kompakte Fassung für GitHub-Issues (Body-Limit 65536 Zeichen): Diffs nur für Oberklassen
 {
   cat "$WORK_DIR/summary.md"
-  if [ -f "$WORK_DIR/report/05-api.md" ]; then
+  if [ -f "$WORK_DIR/api-issue.md" ]; then
     echo
-    sed -n '/^### ❌/,/^$/p' "$WORK_DIR/report/05-api.md"
-    if grep -q '^| Bezug' "$WORK_DIR/report/05-api.md"; then
-      echo "### Geänderte Keycloak-Klassen"
-      echo
-      grep -E '^\|( Bezug|---| \*\*erbt| verwendet)' "$WORK_DIR/report/05-api.md"
-      echo
-    fi
+    cat "$WORK_DIR/api-issue.md"
   fi
-  for f in "$WORK_DIR"/report/0[67]-smoke-*.md; do
-    [ -f "$f" ] && grep -q '^FAIL' "$f" && { echo; cat "$f"; }
+  for f in "$WORK_DIR"/report/0[1-7]-*.md; do
+    case "$f" in *05-api.md|*04-deps.md|*03-bytecode.md) continue;; esac
+    [ -f "$f" ] && grep -q 'FAIL\|ERROR' "$f" && { echo; head -c 6000 "$f"; echo; }
   done
   echo
-  echo "Vollständiger Report mit Quelltext-Diffs aller geänderten Klassen: Workflow-Artefakt \`kc-compat-report\`."
-} | head -c 60000 > "$WORK_DIR/issue.md"
+  echo "Vollständiger Report mit Quelltext-Diffs aller geänderten Klassen und der Liste geänderter Drittbibliotheken: Workflow-Artefakt \`kc-compat-report\`."
+} | head -c 64000 > "$WORK_DIR/issue.md"
 
 echo
 echo "== Gesamt: $overall  (Report: $WORK_DIR/report.md)"
