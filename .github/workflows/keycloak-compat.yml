@@ -38,7 +38,7 @@ concurrency:
 jobs:
   detect:
     name: Neue Version ermitteln
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # fest, damit ein Image-Wechsel (z. B. vorinstalliertes Maven) nichts unbemerkt ändert
     outputs:
       version: ${{ steps.v.outputs.version }}
       baseline: ${{ steps.v.outputs.baseline }}
@@ -82,7 +82,7 @@ jobs:
     name: Keycloak ${{ needs.detect.outputs.version }} prüfen
     needs: detect
     if: needs.detect.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # fest, damit ein Image-Wechsel (z. B. vorinstalliertes Maven) nichts unbemerkt ändert
     timeout-minutes: 45
     env:
       WORK_DIR: ${{ github.workspace }}/.kc-compat
@@ -114,7 +114,7 @@ jobs:
 
       - name: Report hochladen
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: kc-compat-report
           path: |
@@ -123,6 +123,7 @@ jobs:
             .kc-compat/build-*.log
             .kc-compat/smoke-*.log
             .kc-compat/smoke-*.out
+          include-hidden-files: true   # .kc-compat/ beginnt mit einem Punkt
           if-no-files-found: warn
           retention-days: 90
 
