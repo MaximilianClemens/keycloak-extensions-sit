@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # =====================================================================
-# smoke-test.sh – startet einen echten Keycloak mit unserem Jar
+# smoke-test.sh – starts a real Keycloak with our jar
 #
 #   smoke-test.sh <keycloak-version> <provider-jar> <label>
 #
-# Nutzt die offizielle Server-Distribution (org.keycloak:keycloak-quarkus-dist)
-# aus Maven Central – dieselbe, aus der das Container-Image gebaut wird – und
-# braucht daher kein Docker. Voraussetzung: Java 21+, Maven, Python 3.
+# Uses the official server distribution (org.keycloak:keycloak-quarkus-dist)
+# from Maven Central – the same one the container image is built from – so no
+# Docker is needed. Requires Java 21+, Maven, Python 3.
 #
-# Ablauf: Distribution entpacken → Jar nach providers/ → start-dev (inkl.
-# Build-Schritt) → warten bis /health/ready → smoke_exercise.py → Log nach
-# ERROR-Zeilen und Meldungen unserer Klassen durchsuchen.
+# Steps: unpack the distribution → jar into providers/ → start-dev (includes the
+# build step) → wait for /health/ready → smoke_exercise.py → scan the log for
+# ERROR lines and messages from our classes.
 #
-# Ergebnis: $WORK_DIR/smoke-<label>.log (Keycloak-Log),
-#           $WORK_DIR/smoke-<label>.out (Prüfungen),
-#           $WORK_DIR/smoke-<label>.status (STATUS<TAB>Text)
-# Exit-Code 0 = bestanden.
+# Output: $WORK_DIR/smoke-<label>.log    (Keycloak log),
+#         $WORK_DIR/smoke-<label>.out    (checks),
+#         $WORK_DIR/smoke-<label>.status (STATUS<TAB>text)
+# Exit code 0 = passed.
 # =====================================================================
 set -uo pipefail
 
@@ -37,28 +37,28 @@ STATUS="$WORK_DIR/smoke-$LABEL.status"
 
 status() { printf '%s\t%s\n' "$1" "$2" > "$STATUS"; echo "[smoke:$LABEL] $1: $2"; }
 
-# ── Distribution holen (einmal pro Version) ──────────────────────────────
+# ── Fetch the distribution (once per version) ────────────────────────────
 DIST_DIR="$WORK_DIR/dist/keycloak-$KC_VERSION"
 if [ ! -x "$DIST_DIR/bin/kc.sh" ]; then
   mkdir -p "$WORK_DIR/dist"
   if ! $MVN dependency:copy \
         -Dartifact="org.keycloak:keycloak-quarkus-dist:$KC_VERSION:tar.gz" \
         -DoutputDirectory="$WORK_DIR/dist" >> "$OUT" 2>&1; then
-    status FAIL "Keycloak-Distribution $KC_VERSION nicht ladbar"
+    status FAIL "Keycloak distribution $KC_VERSION not available"
     exit 1
   fi
   tar -xzf "$WORK_DIR/dist/keycloak-quarkus-dist-$KC_VERSION.tar.gz" -C "$WORK_DIR/dist"
   rm -f "$WORK_DIR/dist/keycloak-quarkus-dist-$KC_VERSION.tar.gz"
 fi
 
-# Frische Kopie pro Lauf, damit kein Build-/H2-Zustand des anderen Jars übrig bleibt
+# Fresh copy per run so no build/H2 state of the other jar is left over
 RUN_DIR="$WORK_DIR/run-$LABEL"
 rm -rf "$RUN_DIR"
 cp -r "$DIST_DIR" "$RUN_DIR"
 cp "$JAR" "$RUN_DIR/providers/"
 
-# ── Starten ───────────────────────────────────────────────────────────────
-echo "[smoke:$LABEL] starte Keycloak $KC_VERSION mit $(basename "$JAR")"
+# ── Start ─────────────────────────────────────────────────────────────────
+echo "[smoke:$LABEL] starting Keycloak $KC_VERSION with $(basename "$JAR")"
 KC_BOOTSTRAP_ADMIN_USERNAME=admin KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
   "$RUN_DIR/bin/kc.sh" start-dev \
     --http-port="$KC_PORT" \
@@ -87,43 +87,43 @@ done
 
 if ! $ready; then
   {
-    echo "Keycloak ist nicht gestartet. Letzte Logzeilen:"
+    echo "Keycloak did not start. Last log lines:"
     tail -n 60 "$LOG"
   } >> "$OUT"
-  status FAIL "Keycloak startet nicht (siehe smoke-$LABEL.log)"
+  status FAIL "Keycloak does not start (see smoke-$LABEL.log)"
   exit 1
 fi
-echo "[smoke:$LABEL] Keycloak bereit"
+echo "[smoke:$LABEL] Keycloak ready"
 
-# ── Prüfungen über die Admin-API ─────────────────────────────────────────
+# ── Checks via the admin API ─────────────────────────────────────────────
 python3 "$SCRIPT_DIR/smoke_exercise.py" "http://localhost:$KC_PORT" "$SCRIPT_DIR/expected-providers.txt" >> "$OUT" 2>&1
 exercise_rc=$?
 stop_kc
 trap - EXIT
 
-# ── Log auswerten ─────────────────────────────────────────────────────────
+# ── Evaluate the log ──────────────────────────────────────────────────────
 errors=$(grep -E '^[0-9-]+ [0-9:,.]+ +ERROR ' "$LOG" || true)
-# KC-SERVICES0047 ("implementing the internal SPI") ist bei jeder Extension normal und wird ignoriert
+# KC-SERVICES0047 ("implementing the internal SPI") is logged for every extension and is ignored
 own=$(grep -nE 'nrw\.sit\.keycloak' "$LOG" | grep -E 'WARN|ERROR|Exception' | grep -v 'KC-SERVICES0047' || true)
 {
   echo
-  echo "ERROR-Zeilen im Keycloak-Log: $( [ -n "$errors" ] && printf '%s\n' "$errors" | wc -l || echo 0)"
+  echo "ERROR lines in the Keycloak log: $( [ -n "$errors" ] && printf '%s\n' "$errors" | wc -l || echo 0)"
   [ -n "$errors" ] && printf '%s\n' "$errors" | head -n 30
-  echo "Warnungen/Fehler aus nrw.sit.keycloak: $( [ -n "$own" ] && printf '%s\n' "$own" | wc -l || echo 0)"
+  echo "Warnings/errors from nrw.sit.keycloak: $( [ -n "$own" ] && printf '%s\n' "$own" | wc -l || echo 0)"
   [ -n "$own" ] && printf '%s\n' "$own" | head -n 30
 } >> "$OUT"
 
 passed=$(grep -c '^OK ' "$OUT" || true)
 failed=$(grep -c '^FAIL ' "$OUT" || true)
 if [ "$exercise_rc" -ne 0 ]; then
-  status FAIL "$failed von $((passed + failed)) Prüfungen fehlgeschlagen"
+  status FAIL "$failed of $((passed + failed)) checks failed"
   exit 1
 elif [ -n "$errors" ]; then
-  status FAIL "Prüfungen ok, aber ERROR-Zeilen im Keycloak-Log"
+  status FAIL "checks passed, but ERROR lines in the Keycloak log"
   exit 1
 elif [ -n "$own" ]; then
-  status WARN "$passed Prüfungen ok, aber Warnungen aus unseren Klassen im Log"
+  status WARN "$passed checks passed, but warnings from our classes in the log"
 else
-  status PASS "Start ok, $passed Prüfungen bestanden"
+  status PASS "started, $passed checks passed"
 fi
 exit 0

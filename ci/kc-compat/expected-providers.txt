@@ -1,6 +1,6 @@
-# Provider, die nach dem Start in Keycloak registriert sein müssen.
-# Format: <spi> <provider-id>   (SPI-Namen wie in /admin/serverinfo)
-# Bei neuen Providern hier ergänzen - run-all.sh prüft, dass die Anzahl zu META-INF/services passt.
+# Providers that must be registered in Keycloak after startup.
+# Format: <spi> <provider-id>   (SPI names as in /admin/serverinfo)
+# Add new providers here - run-all.sh checks that the count matches META-INF/services.
 authenticator             sit-forward-acr-to-broker
 authenticator             sit-enforce-broker-acr
 authenticator             sit-conditional-requested-loa

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Gibt die neueste finale Keycloak-Version aus, für die die Server-Distribution in
-# Maven Central liegt (Release-Kandidaten, Nightlies o. Ä. werden ignoriert).
+# Prints the newest final Keycloak version whose server distribution is available in
+# Maven Central (release candidates, nightlies and the like are ignored).
 set -euo pipefail
 curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
   https://repo1.maven.org/maven2/org/keycloak/keycloak-quarkus-dist/maven-metadata.xml \
