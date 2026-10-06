@@ -274,8 +274,8 @@ Requires Java 17+.
 
 `.github/workflows/keycloak-compat.yml` runs daily. When Maven Central has a final Keycloak
 release newer than `keycloak.version` in `pom.xml`, it runs `ci/kc-compat/run-all.sh` and
-opens an issue titled `[kc-compat] Keycloak <version> – Kompatibilitätscheck` with the result,
-links to the upgrading guide and release notes, and the source diffs of our superclasses.
+opens an issue titled `[kc-compat] Keycloak <version> – compatibility check` with the result,
+links to the upgrading guide and release notes, and everything about our superclasses (see below).
 Each version is reported once. Delete the issue or start the workflow manually (optionally with
 explicit versions) to check it again.
 
@@ -285,9 +285,19 @@ explicit versions) to check it again.
 | Build + unit tests against the new version | compilation or a test fails |
 | Bytecode old vs. new | — (warns if the classes differ, i.e. the rebuilt jar should be rolled out) |
 | Third-party libraries | — (warns on a minor/major bump of a library we import directly, e.g. webauthn4j) |
-| API/linkage diff of every Keycloak type we use or extend | a referenced method/field/class is gone, an override no longer overrides, or a new abstract method appears; warns and attaches source diffs for every changed class, superclasses first, and lists where Keycloak itself calls methods newly added to our superclasses (e.g. new security checks) |
+| API/linkage diff of every Keycloak type we use or extend | a referenced method/field/class is gone, an override no longer overrides, or a new abstract method appears; warns when an overridden method is no longer called from Keycloak's class hierarchy, or when a relevant class changed |
 | Start Keycloak with the **old** jar | startup fails, a provider is not registered, configuring it via the admin API fails, the protocol mapper does not produce the expected claim, or the log contains `ERROR` lines |
 | Start Keycloak with the **rebuilt** jar | same as above |
+
+For every changed Keycloak class the report shows which of our classes are affected (including the
+inheritance chain), the API changes as Java signatures, the source diff and the upstream commits
+with links to their Keycloak PRs and issues. For our superclasses it additionally lists:
+
+- the methods we override, whether they are unchanged and where Keycloak calls them from;
+- methods newly added to them, where Keycloak itself calls them (e.g. new security checks its own
+  subclasses adopt), the commit that introduced them, and that calling them pins the jar to the
+  new version;
+- types newly introduced in them, with constructors, methods and whether we can access them.
 
 Keycloak is started from the official server distribution (`org.keycloak:keycloak-quarkus-dist`)
 rather than the container image, so the check needs no Docker and runs locally the same way:
@@ -298,7 +308,8 @@ ci/kc-compat/run-all.sh 26.8.0 26.7.4   # explicit versions
 OLD_JAR=dist/my.jar ci/kc-compat/run-all.sh   # use the jar that is actually deployed
 ```
 
-Requires Java 21+, Maven and Python 3. The report ends up in `.kc-compat/report.md`. Add new
+Requires Java 21+, Maven, Python 3 and git (for the upstream commits, a partial fetch of a few MB
+from github.com; the check still runs without it). The report ends up in `.kc-compat/report.md`. Add new
 providers to `ci/kc-compat/expected-providers.txt`; the check fails if its count does not match
 `META-INF/services`.
 

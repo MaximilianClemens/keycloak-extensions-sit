@@ -1,29 +1,29 @@
-# Prüft jedes neue Keycloak-Release automatisch gegen unsere Extensions.
+# Checks every new Keycloak release against our extensions automatically.
 #
-# Täglich wird die neueste finale Keycloak-Version aus Maven Central ermittelt. Ist sie
-# neuer als keycloak.version in pom.xml und gibt es noch kein Issue dazu, läuft
-# ci/kc-compat/run-all.sh (Build, Tests, Bytecode-, API- und Abhängigkeitsvergleich,
-# Keycloak-Start mit altem und neuem Jar) und das Ergebnis landet als Issue im Repo.
+# Once a day the newest final Keycloak release is looked up in Maven Central. If it is newer
+# than keycloak.version in pom.xml and there is no issue for it yet, ci/kc-compat/run-all.sh
+# runs (build, tests, bytecode/API/dependency comparison, Keycloak start with the old and the
+# rebuilt jar) and the result is filed as an issue.
 #
-# Manuell: Actions → "Keycloak-Kompatibilität" → Run workflow, optional mit Versionen.
-# Erneut prüfen lassen: Issue der Version löschen oder den Workflow manuell starten.
-name: Keycloak-Kompatibilität
+# Manually: Actions → "Keycloak compatibility" → Run workflow, optionally with versions.
+# To check a version again: delete its issue or start the workflow manually.
+name: Keycloak compatibility
 
 on:
   schedule:
-    - cron: "17 5 * * *"   # täglich 05:17 UTC
+    - cron: "17 5 * * *"   # daily 05:17 UTC
   workflow_dispatch:
     inputs:
       keycloak_version:
-        description: "Zu prüfende Keycloak-Version (leer = neueste)"
+        description: "Keycloak version to check (empty = newest)"
         required: false
         default: ""
       baseline_version:
-        description: "Basisversion des alten Jars (leer = keycloak.version aus pom.xml)"
+        description: "Base version of the old jar (empty = keycloak.version from pom.xml)"
         required: false
         default: ""
       create_issue:
-        description: "Ergebnis als Issue anlegen bzw. kommentieren"
+        description: "File the result as an issue (or comment on the existing one)"
         type: boolean
         default: false
 
@@ -37,8 +37,8 @@ concurrency:
 
 jobs:
   detect:
-    name: Neue Version ermitteln
-    runs-on: ubuntu-24.04   # fest, damit ein Image-Wechsel (z. B. vorinstalliertes Maven) nichts unbemerkt ändert
+    name: Detect new version
+    runs-on: ubuntu-24.04   # pinned so an image change (e.g. preinstalled Maven) cannot silently change anything
     outputs:
       version: ${{ steps.v.outputs.version }}
       baseline: ${{ steps.v.outputs.baseline }}
@@ -55,22 +55,23 @@ jobs:
         run: |
           NEW="${INPUT_VERSION:-$(ci/kc-compat/latest-version.sh)}"
           BASE="${INPUT_BASELINE:-$(sed -n 's:.*<keycloak.version>\(.*\)</keycloak.version>.*:\1:p' pom.xml | head -n 1)}"
-          TITLE="[kc-compat] Keycloak $NEW – Kompatibilitätscheck"
+          TITLE="[kc-compat] Keycloak $NEW – compatibility check"
           RUN=true
           if [ "${{ github.event_name }}" = "schedule" ]; then
             if [ "$NEW" = "$BASE" ]; then
-              echo "Keycloak $NEW ist bereits die Basisversion – nichts zu tun."
+              echo "Keycloak $NEW already is the base version – nothing to do."
               RUN=false
             elif [ "$(printf '%s\n%s\n' "$NEW" "$BASE" | sort -V | tail -n 1)" != "$NEW" ]; then
-              echo "Keycloak $NEW ist älter als die Basisversion $BASE – nichts zu tun."
+              echo "Keycloak $NEW is older than the base version $BASE – nothing to do."
               RUN=false
-            elif [ -n "$(gh issue list --state all --limit 50 --search "Keycloak $NEW in:title" \
-                         --json title --jq ".[] | select(.title == \"$TITLE\") | .title")" ]; then
-              echo "Für Keycloak $NEW gibt es bereits ein Issue – nichts zu tun."
+            # match on the prefix so renamed/older (e.g. German) titles still count
+            elif [ -n "$(gh issue list --state all --limit 50 --search "Keycloak $NEW in:title" --json title \
+                         --jq ".[] | select(.title | startswith(\"[kc-compat] Keycloak $NEW \")) | .title")" ]; then
+              echo "There already is an issue for Keycloak $NEW – nothing to do."
               RUN=false
             fi
           fi
-          echo "Neu: $NEW, Basis: $BASE, Prüfen: $RUN"
+          echo "New: $NEW, base: $BASE, check: $RUN"
           {
             echo "version=$NEW"
             echo "baseline=$BASE"
@@ -79,10 +80,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   check:
-    name: Keycloak ${{ needs.detect.outputs.version }} prüfen
+    name: Check Keycloak ${{ needs.detect.outputs.version }}
     needs: detect
     if: needs.detect.outputs.run == 'true'
-    runs-on: ubuntu-24.04   # fest, damit ein Image-Wechsel (z. B. vorinstalliertes Maven) nichts unbemerkt ändert
+    runs-on: ubuntu-24.04   # pinned so an image change (e.g. preinstalled Maven) cannot silently change anything
     timeout-minutes: 45
     env:
       WORK_DIR: ${{ github.workspace }}/.kc-compat
@@ -91,28 +92,28 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Keycloak 26 läuft nur auf Java 21+; unser Code wird trotzdem für Java 17 kompiliert.
+      # Keycloak 26 only runs on Java 21+; our code is still compiled for Java 17.
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
           cache: maven
 
-      - name: Kompatibilitätscheck
+      - name: Compatibility check
         id: check
         continue-on-error: true
         run: ci/kc-compat/run-all.sh "$NEW" "$BASE"
 
-      - name: Job-Zusammenfassung
+      - name: Job summary
         if: always()
         run: |
           if [ -f "$WORK_DIR/report.md" ]; then
             head -c 900000 "$WORK_DIR/report.md" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Kein Report erzeugt – siehe Log des Schritts 'Kompatibilitätscheck'." >> "$GITHUB_STEP_SUMMARY"
+            echo "No report was produced – see the log of the 'Compatibility check' step." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Report hochladen
+      - name: Upload report
         if: always()
         uses: actions/upload-artifact@v6
         with:
@@ -120,14 +121,15 @@ jobs:
           path: |
             .kc-compat/report.md
             .kc-compat/summary.md
+            .kc-compat/issue.md
             .kc-compat/build-*.log
             .kc-compat/smoke-*.log
             .kc-compat/smoke-*.out
-          include-hidden-files: true   # .kc-compat/ beginnt mit einem Punkt
+          include-hidden-files: true   # .kc-compat/ starts with a dot
           if-no-files-found: warn
           retention-days: 90
 
-      - name: Issue anlegen
+      - name: File issue
         if: always() && (github.event_name == 'schedule' || inputs.create_issue)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -138,20 +140,20 @@ jobs:
           if [ -f "$WORK_DIR/issue.md" ]; then
             cp "$WORK_DIR/issue.md" "$body"
           else
-            echo "Der Kompatibilitätscheck hat keinen Report erzeugt (Abbruch)." > "$body"
+            echo "The compatibility check did not produce a report (aborted)." > "$body"
           fi
-          printf '\n\nWorkflow-Lauf mit vollständigem Report: %s\n' "$RUN_URL" >> "$body"
+          printf '\n\nWorkflow run with the full report: %s\n' "$RUN_URL" >> "$body"
 
-          existing=$(gh issue list --state all --limit 50 --search "Keycloak $NEW in:title" \
-                       --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n 1)
+          existing=$(gh issue list --state all --limit 50 --search "Keycloak $NEW in:title" --json number,title \
+                       --jq ".[] | select(.title | startswith(\"[kc-compat] Keycloak $NEW \")) | .number" | head -n 1)
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body-file "$body"
           else
             gh issue create --title "$TITLE" --body-file "$body"
           fi
 
-      - name: Ergebnis
+      - name: Result
         if: steps.check.outcome == 'failure'
         run: |
-          echo "::error::Kompatibilitätscheck gegen Keycloak $NEW ist fehlgeschlagen – siehe Zusammenfassung."
+          echo "::error::The compatibility check against Keycloak $NEW failed – see the summary."
           exit 1
