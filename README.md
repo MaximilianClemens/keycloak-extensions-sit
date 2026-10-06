@@ -12,6 +12,7 @@ Built with Claude.
 | `sit-forward-acr-to-broker` | SIT: Forward Client ACR to Broker | Browser Flow | Forwards the requesting client's configured ACR (`minimum.acr.value` / `default.acr.values`) as `acr_values` to the upstream IdP. Place **before** the Identity Provider Redirector. Fixes [Keycloak #42625](https://github.com/keycloak/keycloak/issues/42625). |
 | `sit-enforce-broker-acr` | SIT: Enforce Broker ACR (Post-Broker) | Post Broker Login | Reads the ACR actually reached at the upstream IdP from the validated ID token, writes it into the session (AcrStore), and optionally rejects logins that fall below the client's required level. Fixes [Keycloak #25335](https://github.com/keycloak/keycloak/issues/25335). |
 | `sit-conditional-requested-loa` | Condition - Requested LOA (SIT) | Conditional | Matches on the LOA level **requested** by the client (not what has already been satisfied). Supports `equals`, `minimum`, and `maximum` operators, allowing step-up tiers to be made mutually exclusive by requested level. |
+| `sit-auth-otp-form-no-setup` | SIT: OTP Form (no self-setup) | Browser Flow | The built-in OTP Form without the fallback to OTP self-enrolment. A user without an OTP credential is not sent to *Configure OTP*; with requirement `REQUIRED` the login fails with `credentialSetupRequired` instead. For flows where OTP is provisioned by admins or an upstream process only. |
 
 ### Protocol Mappers
 
@@ -119,6 +120,39 @@ Post Broker Login Flow (Broker Realm):
 2. After the upstream login, `EnforceBrokerAcrAuthenticator` reads the ACR claim from the validated upstream ID token, maps it via the realm's `acr.loa.map`, and stores the result in the session. If the reached level is below the client's required level and enforcement is enabled, the login is rejected – blocking `acr_values` downgrade attempts via browser URL manipulation.
 
 The actual step-up enforcement (OTP/WebAuthn prompts) happens on the **upstream realm** via its own authentication flow and `acr.loa.map`.
+
+---
+
+## OTP Form without self-enrolment (`sit-auth-otp-form-no-setup`)
+
+The built-in *OTP Form* (`auth-otp-form`) reports `isUserSetupAllowed() = true`. When it is
+`REQUIRED` and the user has no OTP credential, `DefaultAuthenticationFlow` does not fail the
+login but schedules the `CONFIGURE_TOTP` required action: the user enrols an authenticator app
+on the spot and continues. In a flow that is meant to *enforce* an existing second factor, that
+is a hole - anyone with a valid password can satisfy the step by enrolling their own OTP.
+
+`OtpFormNoSetupAuthenticator` extends `OTPFormAuthenticator` and changes nothing about OTP
+validation, the form template or the credential provider. The difference is in the factory:
+
+- `isUserSetupAllowed()` returns `false`. With requirement `REQUIRED` and no OTP credential,
+  the flow engine throws `CREDENTIAL_SETUP_REQUIRED` and the user sees the standard
+  "credential setup required" error page.
+- `setRequiredActions()` is overridden to a no-op as a safety net, so no code path through this
+  execution can ever schedule OTP self-enrolment.
+- `getReferenceCategory()` is `otp`, the same as the built-in form, so *Condition - user
+  configured* and credential-based conditions treat both executions identically.
+- Requirement choices are `REQUIRED`, `ALTERNATIVE` and `DISABLED`. No configuration.
+
+| Requirement | User has OTP | Built-in `auth-otp-form` | This provider |
+|---|---|---|---|
+| `REQUIRED` | yes | OTP form | same |
+| `REQUIRED` | no | redirect to *Configure OTP* | **login fails** (`credentialSetupRequired`) |
+| `ALTERNATIVE` | no | execution skipped, next alternative | same |
+
+OTP credentials have to be created by some other route: an admin via the account API or admin
+console, a one-time onboarding flow that still uses the built-in form, or the required action
+assigned explicitly to the user. Both authenticators can be used side by side in different
+flows; the credential is identical.
 
 ---
 
