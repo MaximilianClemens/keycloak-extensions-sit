@@ -3,7 +3,9 @@
 # Once a day the newest final Keycloak release is looked up in Maven Central. If it is newer
 # than keycloak.version in pom.xml and there is no issue for it yet, ci/kc-compat/run-all.sh
 # runs (build, tests, bytecode/API/dependency comparison, Keycloak start with the old and the
-# rebuilt jar) and the result is filed as an issue.
+# rebuilt jar), followed by the Kerberos end-to-end test (ci/kerberos-e2e) against the new
+# release, and the result is filed as an issue. The Kerberos test matters most: the on-demand
+# Kerberos authenticator relies on flow-engine behaviour that a release could change.
 #
 # Manually: Actions → "Keycloak compatibility" → Run workflow, optionally with versions.
 # To check a version again: delete its issue or start the workflow manually.
@@ -104,6 +106,41 @@ jobs:
         continue-on-error: true
         run: ci/kc-compat/run-all.sh "$NEW" "$BASE"
 
+      - name: Install MIT Kerberos (for the Kerberos e2e)
+        id: krb_install
+        continue-on-error: true
+        run: |
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q krb5-kdc krb5-admin-server krb5-user
+
+      - name: Kerberos e2e against Keycloak ${{ needs.detect.outputs.version }}
+        id: kerberos
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          jar="$WORK_DIR/jars/new.jar"; [ -f "$jar" ] || jar="$WORK_DIR/jars/old.jar"
+          if [ ! -f "$jar" ]; then echo "no jar from the compatibility check"; exit 1; fi
+          WORK_DIR="$GITHUB_WORKSPACE/.kerberos-e2e" ci/kerberos-e2e/run.sh "$NEW" "$jar" 2>&1 | tee "$WORK_DIR/kerberos-e2e.log"
+
+      - name: Add the Kerberos e2e to the report
+        if: always()
+        env:
+          OUTCOME: ${{ steps.kerberos.outcome }}
+        run: |
+          section="$RUNNER_TEMP/kerberos.md"
+          {
+            echo
+            echo "## Kerberos e2e (sit-auth-spnego-button)"
+            echo
+            if [ "$OUTCOME" = "success" ]; then echo "Result: **PASS**"; else echo "Result: **FAIL** ($OUTCOME)"; fi
+            echo
+            echo '```'
+            cat .kerberos-e2e/e2e.out 2>/dev/null || tail -n 40 "$WORK_DIR/kerberos-e2e.log" 2>/dev/null || echo "no output"
+            echo '```'
+          } > "$section"
+          mkdir -p "$WORK_DIR"
+          for f in report.md issue.md; do cat "$section" >> "$WORK_DIR/$f"; done
+
       - name: Job summary
         if: always()
         run: |
@@ -125,6 +162,9 @@ jobs:
             .kc-compat/build-*.log
             .kc-compat/smoke-*.log
             .kc-compat/smoke-*.out
+            .kc-compat/kerberos-e2e.log
+            .kerberos-e2e/e2e.out
+            .kerberos-e2e/keycloak.log
           include-hidden-files: true   # .kc-compat/ starts with a dot
           if-no-files-found: warn
           retention-days: 90
@@ -153,7 +193,11 @@ jobs:
           fi
 
       - name: Result
-        if: steps.check.outcome == 'failure'
+        if: steps.check.outcome == 'failure' || steps.kerberos.outcome == 'failure'
+        env:
+          CHECK: ${{ steps.check.outcome }}
+          KERBEROS: ${{ steps.kerberos.outcome }}
         run: |
-          echo "::error::The compatibility check against Keycloak $NEW failed – see the summary."
+          [ "$CHECK" = "failure" ] && echo "::error::The compatibility check against Keycloak $NEW failed – see the summary."
+          [ "$KERBEROS" = "failure" ] && echo "::error::The Kerberos e2e against Keycloak $NEW failed – see the summary."
           exit 1
