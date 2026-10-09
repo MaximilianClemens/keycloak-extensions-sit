@@ -13,6 +13,7 @@ Built with Claude.
 | `sit-enforce-broker-acr` | SIT: Enforce Broker ACR (Post-Broker) | Post Broker Login | Reads the ACR actually reached at the upstream IdP from the validated ID token, writes it into the session (AcrStore), and optionally rejects logins that fall below the client's required level. Fixes [Keycloak #25335](https://github.com/keycloak/keycloak/issues/25335). |
 | `sit-conditional-requested-loa` | Condition - Requested LOA (SIT) | Conditional | Matches on the LOA level **requested** by the client (not what has already been satisfied). Supports `equals`, `minimum`, and `maximum` operators, allowing step-up tiers to be made mutually exclusive by requested level. |
 | `sit-auth-otp-form-no-setup` | SIT: OTP Form (no self-setup) | Browser Flow | The built-in OTP Form without the fallback to OTP self-enrolment. A user without an OTP credential is not sent to *Configure OTP*; with requirement `REQUIRED` the login fails with `credentialSetupRequired` instead. For flows where OTP is provisioned by admins or an upstream process only. |
+| `sit-auth-spnego-button` | SIT: Kerberos (on demand) | Browser Flow | Kerberos/SPNEGO that the user starts from the login page (a "Sign in with Windows" button) instead of running automatically. Works around the built-in authenticator ending in *page expired* when chosen via *Try another way*. `ALTERNATIVE`, placed **before** the forms sub-flow. |
 
 ### Protocol Mappers
 
@@ -153,6 +154,102 @@ OTP credentials have to be created by some other route: an admin via the account
 console, a one-time onboarding flow that still uses the built-in form, or the required action
 assigned explicitly to the user. Both authenticators can be used side by side in different
 flows; the credential is identical.
+
+---
+
+## Kerberos on demand (`sit-auth-spnego-button`)
+
+The built-in *Kerberos* authenticator (`auth-spnego`) challenges on the first request it sees.
+In a multi-tenant platform where only some users sit on a domain-joined machine, that means a
+silent `401 Negotiate` for everyone, NTLM fallbacks and browser credential prompts. What we want
+is Kerberos as a *choice* next to password and passkey: a button on the login page.
+
+Keycloak already has the mechanism for that: executions that are `ALTERNATIVE` and whose
+authenticator does not require a user are listed in `auth.authenticationSelections` of the
+login form, and posting `authenticationExecution=<id>` switches the flow to that execution.
+With the built-in authenticator this ends in **"Page has expired"**
+([forum thread](https://forum.keycloak.org/t/access-with-kerberos-fails-if-we-choose-the-authentication/5137),
+open since Keycloak 11), and the reason is structural:
+
+1. The selection is a `POST` to `login-actions/authenticate?session_code=A&execution=<form>`.
+2. `auth-spnego` answers it with `401 WWW-Authenticate: Negotiate`.
+3. The browser repeats **the same POST** with the ticket. `session_code` is single use and was
+   consumed in step 1, and `execution` still names the form while the flow engine already
+   switched to Kerberos, so `AuthenticationProcessor#authenticationAction` shows *page expired*
+   before the authenticator ever sees the token. Nothing is logged.
+
+`SpnegoButtonAuthenticator` extends `SpnegoAuthenticator` and moves the challenge onto a
+request whose retry is harmless, a `GET` of the flow's refresh URL (no `session_code`, no
+`execution`):
+
+| Request | What happens |
+|---|---|
+| first pass of the flow (no header, no selection) | `attempted()`; the next alternative (the form) renders and lists this execution in `authenticationSelections` |
+| `POST` with `authenticationExecution=<this>` (button) | `AuthenticationProcessor.resetFlow()`, auth note `sit.spnego-button.requested=true`, `303` to `getRefreshUrl()` |
+| `GET` refresh URL, note set | built-in behaviour: `401 Negotiate` with Keycloak's auto-submitting fallback form in the body |
+| browser retry of that `GET` with `Authorization: Negotiate …` | built-in validation through the Kerberos user federation provider; note cleared |
+| no ticket: fallback form posts to this execution | `action()` clears the note, `attempted()`, the password form renders |
+
+Ticket validation, keytab handling and user lookup are untouched; the Kerberos settings live
+in the LDAP/Kerberos user federation provider as before. The factory reports the `kerberos`
+reference category like the built-in one and offers `ALTERNATIVE` and `DISABLED` only.
+
+### Flow
+
+```
+Browser flow
+├─ Cookie                        ALTERNATIVE
+├─ Identity Provider Redirector  ALTERNATIVE
+├─ SIT: Kerberos (on demand)     ALTERNATIVE   ← before the forms
+└─ Forms                         ALTERNATIVE
+   ├─ Username Password Form     REQUIRED
+   └─ …
+```
+
+The position matters: after the flow reset the refresh `GET` runs the flow from the top and
+renders the first unprocessed alternative. Placed after the forms, this execution would never
+be reached and the user would simply see the login form again. Leave the built-in *Kerberos*
+execution `DISABLED` in the same flow.
+
+### Theme
+
+The login page gets the execution through `auth.authenticationSelections`; the only property
+that identifies it is the authenticator id. A minimal `login.ftl` override adds one line, for
+example right after the login `</form>`:
+
+```ftl
+<#include "sit-kerberos-button.ftl">
+```
+
+`sit-kerberos-button.ftl`:
+
+```ftl
+<#if auth?? && auth.authenticationSelections??>
+  <#list auth.authenticationSelections as sel>
+    <#if (sel.authenticationExecution.authenticator)! == "sit-auth-spnego-button">
+      <form method="post" action="${url.loginAction}" class="sit-kerberos-form">
+        <input type="hidden" name="authenticationExecution" value="${sel.authExecId}">
+        <button type="submit"
+                class="${properties.kcButtonClass!} ${properties.kcButtonSecondaryClass!} ${properties.kcButtonBlockClass!} ${properties.kcButtonLargeClass!}">
+          ${msg("sit.kerberos.button", "Sign in with Windows")}
+        </button>
+      </form>
+    </#if>
+  </#list>
+</#if>
+```
+
+`#kc-select-try-another-way-form` can be hidden with CSS if the button is the only alternative
+that should be offered.
+
+### Client side
+
+The browser still has to be willing to send a ticket to the Keycloak host: Windows zone
+*Local intranet* (or `AuthServerAllowlist` for Chrome/Edge, `network.negotiate-auth.trusted-uris`
+for Firefox), SPN and keytab for `HTTP/<keycloak-host>` in the user's domain. A credential
+prompt instead of a login means the browser refused to use SSPI for that host; a silent return
+to the password form means it sent no ticket (check `chrome://net-export`, look for
+`allows_default_credentials`).
 
 ---
 
