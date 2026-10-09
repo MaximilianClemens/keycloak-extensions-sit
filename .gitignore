@@ -8,3 +8,4 @@ settings.xml
 .DS_Store
 .kc-compat/
 __pycache__/
+.login-e2e/
