@@ -1,5 +1,6 @@
 package nrw.sit.keycloak.authenticator;
 
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.keycloak.authentication.authenticators.browser.SpnegoAuthenticatorFactory;
 import org.keycloak.common.Profile;
@@ -21,6 +22,15 @@ import static org.mockito.Mockito.mock;
 class SpnegoButtonAuthenticatorFactoryTest {
 
     private final SpnegoButtonAuthenticatorFactory factory = new SpnegoButtonAuthenticatorFactory();
+
+    @BeforeAll
+    static void configureDefaultProfile() {
+        // The factory consults the Kerberos feature flag like the built-in one; outside a
+        // server there is no profile yet, so use the defaults (Kerberos is a default feature).
+        if (Profile.getInstance() == null) {
+            Profile.configure();
+        }
+    }
 
     @Test
     void usesItsOwnProviderId() {
