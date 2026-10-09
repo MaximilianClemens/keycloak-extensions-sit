@@ -7,10 +7,13 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.authentication.AuthenticationProcessor;
+import org.keycloak.authentication.FlowStatus;
 import org.keycloak.authentication.authenticators.browser.SpnegoAuthenticator;
 import org.keycloak.http.HttpRequest;
+import org.keycloak.models.AuthenticationExecutionModel;
 import org.keycloak.models.Constants;
 import org.keycloak.sessions.AuthenticationSessionModel;
+import org.keycloak.sessions.CommonClientSessionModel.ExecutionStatus;
 
 /**
  * Kerberos/SPNEGO that is triggered on demand (a "Sign in with Windows" button on the login
@@ -36,30 +39,31 @@ import org.keycloak.sessions.AuthenticationSessionModel;
  * The SPNEGO challenge is moved onto a request whose retry is harmless: a {@code GET} of the
  * flow's refresh URL, which carries neither {@code session_code} nor {@code execution}.
  * <ol>
- *   <li><b>Initial pass</b> (no header, no selection): {@link AuthenticationFlowContext#attempted()},
- *       so the next alternative (the username/password form) renders. Because the factory
- *       reports the Kerberos reference category and the authenticator does not require a user,
- *       the execution appears in {@code auth.authenticationSelections} of the form, where the
- *       theme renders it as a button.</li>
+ *   <li><b>Login page</b>: the execution sits <b>after</b> the forms sub-flow, so the first pass
+ *       of the flow never reaches it. It is therefore still unprocessed and, because the
+ *       factory reports the Kerberos reference category and the authenticator does not require
+ *       a user, listed in {@code auth.authenticationSelections}, where the theme renders it as
+ *       a button. (An execution that has already reported "attempted" is not listed, which is
+ *       why it must not run before the form.)</li>
  *   <li><b>Button click</b> (POST with {@code authenticationExecution}): the flow is reset
- *       ({@link AuthenticationProcessor#resetFlow}), the request is remembered in the auth
- *       session note {@value #REQUESTED_NOTE}, and the browser is redirected (303) to the
- *       refresh URL.</li>
+ *       ({@link AuthenticationProcessor#resetFlow}), every sibling execution of the parent
+ *       flow is marked {@code ATTEMPTED} so the next pass skips the forms and lands here, the
+ *       request is remembered in the auth session note {@value #REQUESTED_NOTE}, and the
+ *       browser is redirected (303) to the refresh URL.</li>
  *   <li><b>GET refresh URL</b> with the note set: the built-in behaviour runs and sends
- *       {@code 401 Negotiate}. Because the flow was reset, this execution is the first
- *       unprocessed alternative and is reached before the form.</li>
+ *       {@code 401 Negotiate} with Keycloak's auto-submitting fallback form in the body.</li>
  *   <li><b>Browser retry</b> of that GET with {@code Authorization: Negotiate ...}: the ticket is
- *       validated exactly as by the built-in authenticator (Kerberos user federation).</li>
- *   <li><b>No ticket</b>: the body of the 401 is Keycloak's auto-submitting fallback form; its
- *       POST lands in {@link #action}, which clears the note and reports "attempted", so the
- *       password form renders.</li>
+ *       validated exactly as by the built-in authenticator (Kerberos user federation). If the
+ *       ticket is rejected, the flow is reset so the user gets the password form instead of a
+ *       dead end.</li>
+ *   <li><b>No ticket</b>: the fallback form posts to this execution, {@link #action} resets the
+ *       flow, and the password form renders with the button available again.</li>
  * </ol>
  *
  * <h2>Flow placement</h2>
  *
- * Requirement {@code ALTERNATIVE}, in the top-level browser flow <b>before</b> the forms
- * sub-flow (after Cookie and Identity Provider Redirector). Placed after the forms it would
- * never be reached on the refresh GET, because the form is the first unprocessed alternative.
+ * Requirement {@code ALTERNATIVE}, in the top-level browser flow <b>after</b> the forms
+ * sub-flow, as a sibling of it. Leave the built-in Kerberos execution {@code DISABLED}.
  */
 public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
 
@@ -81,15 +85,22 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
             logger.trace("Authorization header present, validating SPNEGO token");
             authSession.removeAuthNote(REQUESTED_NOTE);
             super.authenticate(context);
+            if (context.getStatus() == FlowStatus.FAILED || context.getStatus() == FlowStatus.ATTEMPTED) {
+                // Siblings were skipped for this attempt; without a reset the flow would have
+                // nothing left to offer. Back to the password form instead.
+                logger.debug("SPNEGO token rejected, resetting flow to the login form");
+                context.resetFlow();
+            }
             return;
         }
 
         if (isSelectedViaButton(request)) {
-            // Phase 1: the user clicked the button. Reset the flow so that this execution is the
-            // first unprocessed alternative on the next request, remember the request, and move
-            // the browser onto a code-less GET where a 401 retry is safe.
+            // Phase 1: the user clicked the button. Start over, skip the siblings so that the
+            // next pass lands here, remember the request, and move the browser onto a
+            // code-less GET where a 401 retry is safe.
             logger.debug("Kerberos requested via authentication selection, resetting flow and redirecting to refresh URL");
             AuthenticationProcessor.resetFlow(authSession, context.getFlowPath());
+            skipSiblings(context);
             authSession.setAuthNote(REQUESTED_NOTE, "true");
             context.challenge(Response.seeOther(context.getRefreshUrl(false)).build());
             return;
@@ -103,7 +114,7 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
             return;
         }
 
-        // Nothing requested: stay silent so the next alternative renders.
+        // Reached without a request (e.g. placed before the form): stay silent.
         logger.trace("Kerberos not requested, skipping");
         context.attempted();
     }
@@ -111,9 +122,22 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
     @Override
     public void action(AuthenticationFlowContext context) {
         // Reached through the fallback form in the 401 body (browser had no ticket) or any
-        // other POST to this execution. Clear the request so a reload does not challenge again.
+        // other POST to this execution. The siblings are still marked as skipped, so start
+        // over: the password form renders and this execution is offered again.
         context.getAuthenticationSession().removeAuthNote(REQUESTED_NOTE);
-        super.action(context);
+        context.resetFlow();
+    }
+
+    /**
+     * Marks every other execution of the parent flow as attempted, so that the next pass of
+     * the flow engine skips them and reaches this execution.
+     */
+    static void skipSiblings(AuthenticationFlowContext context) {
+        AuthenticationExecutionModel self = context.getExecution();
+        AuthenticationSessionModel authSession = context.getAuthenticationSession();
+        context.getRealm().getAuthenticationExecutionsStream(self.getParentFlow())
+                .filter(e -> !e.getId().equals(self.getId()))
+                .forEach(e -> authSession.setExecutionStatus(e.getId(), ExecutionStatus.ATTEMPTED));
     }
 
     /**

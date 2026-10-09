@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.authentication.AuthenticationFlowError;
 import org.keycloak.authentication.AuthenticationProcessor;
+import org.keycloak.authentication.FlowStatus;
 import org.keycloak.authentication.authenticators.browser.SpnegoAuthenticator;
 import org.keycloak.events.Errors;
 import org.keycloak.events.EventBuilder;
@@ -21,6 +22,7 @@ import org.keycloak.models.UserCredentialModel;
 import org.keycloak.models.UserModel;
 import org.keycloak.models.UserProvider;
 import org.keycloak.sessions.AuthenticationSessionModel;
+import org.keycloak.sessions.CommonClientSessionModel.ExecutionStatus;
 import org.keycloak.sessions.RootAuthenticationSessionModel;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
@@ -28,6 +30,7 @@ import org.mockito.InOrder;
 import java.net.URI;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -57,6 +60,9 @@ class SpnegoButtonAuthenticatorTest {
     private final AuthenticationSessionModel authSession = mock(AuthenticationSessionModel.class);
     private final RootAuthenticationSessionModel rootSession = mock(RootAuthenticationSessionModel.class);
     private final AuthenticationExecutionModel execution = mock(AuthenticationExecutionModel.class);
+    private final AuthenticationExecutionModel cookie = mock(AuthenticationExecutionModel.class);
+    private final AuthenticationExecutionModel forms = mock(AuthenticationExecutionModel.class);
+    private final RealmModel realm = mock(RealmModel.class);
     private final KeycloakSession session = mock(KeycloakSession.class);
     private final UserProvider users = mock(UserProvider.class);
     private final EventBuilder event = mock(EventBuilder.class);
@@ -70,7 +76,7 @@ class SpnegoButtonAuthenticatorTest {
         when(context.getAuthenticationSession()).thenReturn(authSession);
         when(context.getHttpRequest()).thenReturn(request);
         when(context.getSession()).thenReturn(session);
-        when(context.getRealm()).thenReturn(mock(RealmModel.class));
+        when(context.getRealm()).thenReturn(realm);
         when(context.getEvent()).thenReturn(event);
         when(context.getExecution()).thenReturn(execution);
         when(context.getFlowPath()).thenReturn("authenticate");
@@ -89,6 +95,12 @@ class SpnegoButtonAuthenticatorTest {
         when(headers.getRequestHeaders()).thenReturn(requestHeaders);
 
         when(execution.isRequired()).thenReturn(false);
+        when(execution.getId()).thenReturn("krb-exec-id");
+        when(execution.getParentFlow()).thenReturn("browser-flow-id");
+        when(cookie.getId()).thenReturn("cookie-exec-id");
+        when(forms.getId()).thenReturn("forms-exec-id");
+        when(realm.getAuthenticationExecutionsStream("browser-flow-id"))
+                .thenAnswer(inv -> Stream.of(cookie, execution, forms));
     }
 
     // ── phase 0: nothing requested ───────────────────────────────────────────
@@ -106,19 +118,22 @@ class SpnegoButtonAuthenticatorTest {
     // ── phase 1: button click (authentication selection POST) ────────────────
 
     @Test
-    void buttonClickResetsTheFlowMarksTheRequestAndRedirectsToTheRefreshUrl() {
+    void buttonClickResetsTheFlowSkipsTheSiblingsMarksTheRequestAndRedirectsToTheRefreshUrl() {
         when(request.getHttpMethod()).thenReturn("POST");
         form.putSingle(Constants.AUTHENTICATION_EXECUTION, "krb-exec-id");
 
         authenticator.authenticate(context);
 
-        // flow reset (statuses and notes gone) BEFORE the request marker is written
+        // flow reset (statuses and notes gone) BEFORE siblings are skipped and the marker is written
         InOrder order = inOrder(authSession);
         order.verify(authSession).clearExecutionStatus();
         order.verify(authSession).clearAuthNotes();
         order.verify(authSession).setAuthNote(AuthenticationProcessor.CURRENT_FLOW_PATH, "authenticate");
+        order.verify(authSession).setExecutionStatus("cookie-exec-id", ExecutionStatus.ATTEMPTED);
+        order.verify(authSession).setExecutionStatus("forms-exec-id", ExecutionStatus.ATTEMPTED);
         order.verify(authSession).setAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE, "true");
         verify(authSession).setAuthenticatedUser(null);
+        verify(authSession, never()).setExecutionStatus(eq("krb-exec-id"), any());
 
         ArgumentCaptor<Response> captor = ArgumentCaptor.forClass(Response.class);
         verify(context).challenge(captor.capture());
@@ -171,16 +186,43 @@ class SpnegoButtonAuthenticatorTest {
     }
 
     @Test
-    void rejectsAnInvalidTicket() {
+    void anInvalidTicketIsRejectedAndTheFlowResetToTheLoginForm() {
         requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "Negotiate YIIbad");
         when(users.getUserByCredential(any(), any()))
                 .thenReturn(new CredentialValidationOutput(null, CredentialValidationOutput.Status.FAILED, Map.of()));
+        when(context.getStatus()).thenReturn(FlowStatus.FAILED);
 
         authenticator.authenticate(context);
 
         verify(authSession).removeAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE);
         verify(event).error(Errors.INVALID_USER_CREDENTIALS);
         verify(context).failure(AuthenticationFlowError.INVALID_CREDENTIALS);
+        // siblings were skipped for this attempt, so a reset is the only way back to the form
+        verify(context).resetFlow();
+    }
+
+    @Test
+    void aTicketNobodyCanValidateFallsBackToTheLoginForm() {
+        requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "Negotiate YIIabc");
+        when(users.getUserByCredential(any(), any())).thenReturn(null);
+        when(context.getStatus()).thenReturn(FlowStatus.ATTEMPTED);
+
+        authenticator.authenticate(context);
+
+        verify(context).attempted();
+        verify(context).resetFlow();
+    }
+
+    @Test
+    void aValidTicketDoesNotResetTheFlow() {
+        requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "Negotiate YIIabc");
+        when(users.getUserByCredential(any(), any()))
+                .thenReturn(new CredentialValidationOutput(mock(UserModel.class), CredentialValidationOutput.Status.AUTHENTICATED, Map.of()));
+        when(context.getStatus()).thenReturn(FlowStatus.SUCCESS);
+
+        authenticator.authenticate(context);
+
+        verify(context, never()).resetFlow();
     }
 
     @Test
@@ -200,11 +242,22 @@ class SpnegoButtonAuthenticatorTest {
     // ── fallback form / action ───────────────────────────────────────────────
 
     @Test
-    void actionClearsTheMarkerAndReportsAttempted() {
+    void actionClearsTheMarkerAndResetsTheFlow() {
         authenticator.action(context);
 
         verify(authSession).removeAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE);
-        verify(context).attempted();
+        // not attempted(): the skipped siblings must come back, so the flow starts over
+        verify(context).resetFlow();
+        verify(context, never()).attempted();
+    }
+
+    @Test
+    void skipSiblingsLeavesTheOwnExecutionAlone() {
+        SpnegoButtonAuthenticator.skipSiblings(context);
+
+        verify(authSession).setExecutionStatus("cookie-exec-id", ExecutionStatus.ATTEMPTED);
+        verify(authSession).setExecutionStatus("forms-exec-id", ExecutionStatus.ATTEMPTED);
+        verify(authSession, never()).setExecutionStatus(eq("krb-exec-id"), any());
     }
 
     // ── selection detection ──────────────────────────────────────────────────

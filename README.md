@@ -13,7 +13,7 @@ Built with Claude.
 | `sit-enforce-broker-acr` | SIT: Enforce Broker ACR (Post-Broker) | Post Broker Login | Reads the ACR actually reached at the upstream IdP from the validated ID token, writes it into the session (AcrStore), and optionally rejects logins that fall below the client's required level. Fixes [Keycloak #25335](https://github.com/keycloak/keycloak/issues/25335). |
 | `sit-conditional-requested-loa` | Condition - Requested LOA (SIT) | Conditional | Matches on the LOA level **requested** by the client (not what has already been satisfied). Supports `equals`, `minimum`, and `maximum` operators, allowing step-up tiers to be made mutually exclusive by requested level. |
 | `sit-auth-otp-form-no-setup` | SIT: OTP Form (no self-setup) | Browser Flow | The built-in OTP Form without the fallback to OTP self-enrolment. A user without an OTP credential is not sent to *Configure OTP*; with requirement `REQUIRED` the login fails with `credentialSetupRequired` instead. For flows where OTP is provisioned by admins or an upstream process only. |
-| `sit-auth-spnego-button` | SIT: Kerberos (on demand) | Browser Flow | Kerberos/SPNEGO that the user starts from the login page (a "Sign in with Windows" button) instead of running automatically. Works around the built-in authenticator ending in *page expired* when chosen via *Try another way*. `ALTERNATIVE`, placed **before** the forms sub-flow. |
+| `sit-auth-spnego-button` | SIT: Kerberos (on demand) | Browser Flow | Kerberos/SPNEGO that the user starts from the login page (a "Sign in with Windows" button) instead of running automatically. Works around the built-in authenticator ending in *page expired* when chosen via *Try another way*. `ALTERNATIVE`, placed after the forms sub-flow. Verified end-to-end against a real KDC in CI. |
 
 ### Protocol Mappers
 
@@ -50,6 +50,13 @@ mvn test -Dkeycloak.version=26.7.4          # local Maven/JDK 17+
 
 `build_jar.sh` and the image build keep using `-DskipTests`; the test code is compiled there
 but not executed.
+
+`ci/kerberos-e2e/run.sh` goes one step further for the on-demand Kerberos authenticator: it
+sets up a throwaway MIT KDC, starts the real Keycloak distribution with the jar, configures a
+realm through the admin API and plays the login with `curl --negotiate` (ticket accepted,
+fallback without ticket, and the upstream "page expired" behaviour of the built-in
+authenticator). `.github/workflows/kerberos-e2e.yml` runs it on every push. Needs root
+(KDC, `/etc/hosts`), so it is meant for CI runners or throwaway VMs.
 
 ---
 
@@ -184,11 +191,11 @@ request whose retry is harmless, a `GET` of the flow's refresh URL (no `session_
 
 | Request | What happens |
 |---|---|
-| first pass of the flow (no header, no selection) | `attempted()`; the next alternative (the form) renders and lists this execution in `authenticationSelections` |
-| `POST` with `authenticationExecution=<this>` (button) | `AuthenticationProcessor.resetFlow()`, auth note `sit.spnego-button.requested=true`, `303` to `getRefreshUrl()` |
+| first pass of the flow | the execution sits after the forms, so it is never reached; being unprocessed, it is listed in `authenticationSelections` (Keycloak drops executions that already reported *attempted*) |
+| `POST` with `authenticationExecution=<this>` (button) | `AuthenticationProcessor.resetFlow()`, every sibling execution of the parent flow marked `ATTEMPTED` (so the next pass skips the forms), auth note `sit.spnego-button.requested=true`, `303` to `getRefreshUrl()` |
 | `GET` refresh URL, note set | built-in behaviour: `401 Negotiate` with Keycloak's auto-submitting fallback form in the body |
-| browser retry of that `GET` with `Authorization: Negotiate …` | built-in validation through the Kerberos user federation provider; note cleared |
-| no ticket: fallback form posts to this execution | `action()` clears the note, `attempted()`, the password form renders |
+| browser retry of that `GET` with `Authorization: Negotiate …` | built-in validation through the Kerberos user federation provider; a rejected ticket resets the flow back to the password form |
+| no ticket: fallback form posts to this execution | `action()` resets the flow; the password form renders and the option is offered again |
 
 Ticket validation, keytab handling and user lookup are untouched; the Kerberos settings live
 in the LDAP/Kerberos user federation provider as before. The factory reports the `kerberos`
@@ -199,17 +206,18 @@ reference category like the built-in one and offers `ALTERNATIVE` and `DISABLED`
 ```
 Browser flow
 ├─ Cookie                        ALTERNATIVE
+├─ Kerberos (built-in)           DISABLED
 ├─ Identity Provider Redirector  ALTERNATIVE
-├─ SIT: Kerberos (on demand)     ALTERNATIVE   ← before the forms
-└─ Forms                         ALTERNATIVE
-   ├─ Username Password Form     REQUIRED
-   └─ …
+├─ Forms                         ALTERNATIVE
+│  ├─ Username Password Form     REQUIRED
+│  └─ …
+└─ SIT: Kerberos (on demand)     ALTERNATIVE   ← after the forms, same level
 ```
 
-The position matters: after the flow reset the refresh `GET` runs the flow from the top and
-renders the first unprocessed alternative. Placed after the forms, this execution would never
-be reached and the user would simply see the login form again. Leave the built-in *Kerberos*
-execution `DISABLED` in the same flow.
+The position matters in both directions. Placed *before* the forms, the execution runs on the
+first pass, reports *attempted* and is no longer offered on the login page. Placed *after*
+them, it is offered, and the button click takes care of being reached on the next pass by
+skipping its siblings. Leave the built-in *Kerberos* execution `DISABLED` (or remove it).
 
 ### Theme
 
