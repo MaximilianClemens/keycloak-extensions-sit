@@ -45,7 +45,8 @@ fi
 echo "[e2e] jar: $JAR"
 
 # ── KDC ──────────────────────────────────────────────────────────────────
-"$SCRIPT_DIR/setup-kdc.sh" "$WORK_DIR" || exit 1
+export PKINIT_DIR="${PKINIT_DIR:-$WORK_DIR/pkinit}"
+"$SCRIPT_DIR/setup-kdc.sh" "$WORK_DIR" || { echo "[e2e] KDC setup failed"; exit 1; }
 KEYTAB="$WORK_DIR/keycloak.keytab"
 
 # ── Keycloak distribution ────────────────────────────────────────────────

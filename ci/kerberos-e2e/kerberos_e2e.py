@@ -56,7 +56,7 @@ PROVIDER_BUTTON = "sit-auth-spnego-button"
 PROVIDER_BUILTIN = "auth-spnego"
 PROVIDER_LEVEL = "sit-auth-spnego-level"
 PROVIDER_CURRENT_LOA = "sit-conditional-current-loa"
-PKINIT_DIR = os.path.join(os.path.dirname(os.path.abspath(KEYTAB)), "pkinit")
+PKINIT_DIR = os.environ.get("PKINIT_DIR", os.path.join(os.path.dirname(os.path.abspath(KEYTAB)), "pkinit"))
 
 failures = []
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
