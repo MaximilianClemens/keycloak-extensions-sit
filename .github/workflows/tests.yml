@@ -25,7 +25,18 @@ jobs:
           cache: maven
 
       - name: Build and run unit tests
-        run: mvn -B --no-transfer-progress test
+        run: |
+          set -o pipefail
+          mvn -B --no-transfer-progress test 2>&1 | tee build.log
+
+      - name: Report failures as annotations
+        if: failure()
+        run: |
+          # Compile errors, failed tests and Maven errors, readable without the raw log.
+          grep -E "ERROR\]|FAILURE|Tests run:.*(Failures: [1-9]|Errors: [1-9])|<<< (FAILURE|ERROR)|expected:|but was:" build.log \
+            | grep -vE "^\[ERROR\] *$|Re-run Maven|full stack trace|Help [0-9]|cwiki.apache.org|read the following" \
+            | head -n 40 \
+            | while IFS= read -r line; do echo "::error::${line}"; done
 
       - name: Summary
         if: always()
