@@ -6,14 +6,23 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 import org.keycloak.authentication.AuthenticationFlowContext;
+import org.keycloak.authentication.AuthenticatorFactory;
 import org.keycloak.authentication.AuthenticationProcessor;
 import org.keycloak.authentication.FlowStatus;
 import org.keycloak.authentication.authenticators.browser.SpnegoAuthenticator;
+import org.keycloak.authentication.authenticators.conditional.ConditionalAuthenticatorFactory;
+import org.keycloak.common.constants.KerberosConstants;
 import org.keycloak.http.HttpRequest;
 import org.keycloak.models.AuthenticationExecutionModel;
+import org.keycloak.models.AuthenticationFlowModel;
 import org.keycloak.models.Constants;
+import org.keycloak.models.KeycloakSession;
+import org.keycloak.models.RealmModel;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.sessions.CommonClientSessionModel.ExecutionStatus;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Kerberos/SPNEGO that is triggered on demand (a "Sign in with Windows" button on the login
@@ -64,6 +73,23 @@ import org.keycloak.sessions.CommonClientSessionModel.ExecutionStatus;
  *
  * Requirement {@code ALTERNATIVE}, in the top-level browser flow <b>after</b> the forms
  * sub-flow, as a sibling of it. Leave the built-in Kerberos execution {@code DISABLED}.
+ *
+ * <p>To offer the button only under a condition (e.g. internal network), wrap it twice: an
+ * {@code ALTERNATIVE} sub-flow after the forms, containing a {@code CONDITIONAL} sub-flow with
+ * the condition(s) and this execution as {@code REQUIRED}. A single {@code ALTERNATIVE} sub-flow
+ * is not enough (Keycloak ignores conditions there), and a {@code CONDITIONAL} sub-flow directly
+ * in the top-level flow would make Keycloak ignore all top-level alternatives.
+ *
+ * <h2>Safety rules</h2>
+ * <ul>
+ *   <li>Only the {@code ALTERNATIVE} executions along the path to the top-level flow are
+ *       skipped. If that path has a {@code REQUIRED} or {@code CONDITIONAL} sibling (anything
+ *       except condition authenticators), the click is refused and nothing is skipped, so a
+ *       misconfigured flow can never bypass a mandatory step.</li>
+ *   <li>A click only counts if the selection names this very execution.</li>
+ *   <li>An {@code Authorization} header is only evaluated after the user clicked the button;
+ *       otherwise it is ignored.</li>
+ * </ul>
  */
 public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
 
@@ -78,11 +104,12 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
     public void authenticate(AuthenticationFlowContext context) {
         AuthenticationSessionModel authSession = context.getAuthenticationSession();
         HttpRequest request = context.getHttpRequest();
+        boolean requested = Boolean.parseBoolean(authSession.getAuthNote(REQUESTED_NOTE));
         String authHeader = request.getHttpHeaders().getRequestHeaders().getFirst(HttpHeaders.AUTHORIZATION);
 
-        if (authHeader != null) {
-            // The browser answered a challenge. Validate like the built-in authenticator.
-            logger.trace("Authorization header present, validating SPNEGO token");
+        if (authHeader != null && requested) {
+            // The browser answered our challenge. Validate like the built-in authenticator.
+            logger.trace("Authorization header present after a button click, validating SPNEGO token");
             authSession.removeAuthNote(REQUESTED_NOTE);
             super.authenticate(context);
             if (context.getStatus() == FlowStatus.FAILED || context.getStatus() == FlowStatus.ATTEMPTED) {
@@ -93,24 +120,37 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
             }
             return;
         }
+        if (authHeader != null) {
+            // Kerberos only on demand: a header the user did not ask for is not evaluated.
+            logger.trace("Authorization header without a button click, ignored");
+        }
 
-        if (isSelectedViaButton(request)) {
-            // Phase 1: the user clicked the button. Start over, skip the siblings so that the
-            // next pass lands here, remember the request, and move the browser onto a
-            // code-less GET where a 401 retry is safe.
+        if (isSelectedViaButton(request, context.getExecution())) {
+            // Phase 1: the user clicked the button. Work out what to skip before touching the
+            // session: if the flow has a mandatory sibling on the way up, refuse.
+            List<String> skip = executionsToSkip(context.getSession(), context.getRealm(), context.getExecution());
+            if (skip == null) {
+                logger.warnf("Kerberos button in flow path '%s' refused: a REQUIRED or CONDITIONAL sibling would be "
+                        + "skipped. Place it as described in the help text.", context.getFlowPath());
+                context.attempted();
+                return;
+            }
+            // Start over, skip the alternatives so that the next pass lands here, remember the
+            // request, and move the browser onto a code-less GET where a 401 retry is safe.
             logger.debug("Kerberos requested via authentication selection, resetting flow and redirecting to refresh URL");
             AuthenticationProcessor.resetFlow(authSession, context.getFlowPath());
-            skipSiblings(context);
+            skip.forEach(id -> authSession.setExecutionStatus(id, ExecutionStatus.ATTEMPTED));
             authSession.setAuthNote(REQUESTED_NOTE, "true");
             context.challenge(Response.seeOther(context.getRefreshUrl(false)).build());
             return;
         }
 
-        if (Boolean.parseBoolean(authSession.getAuthNote(REQUESTED_NOTE))) {
-            // Phase 2: GET after the redirect. The built-in implementation sends 401 Negotiate
-            // (with the auto-submitting fallback form, as the execution is ALTERNATIVE).
+        if (requested) {
+            // Phase 2: GET after the redirect: 401 Negotiate with Keycloak's auto-submitting
+            // fallback form. Always the fallback variant, also when the execution is REQUIRED inside
+            // a conditional sub-flow (the built-in code would send a dead-end error page then).
             logger.debug("Kerberos requested, sending SPNEGO challenge");
-            super.authenticate(context);
+            context.forceChallenge(optionalChallengeRedirect(context, KerberosConstants.NEGOTIATE));
             return;
         }
 
@@ -129,22 +169,57 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
     }
 
     /**
-     * Marks every other execution of the parent flow as attempted, so that the next pass of
-     * the flow engine skips them and reaches this execution.
+     * The executions that must be marked {@code ATTEMPTED} so that the next pass of the flow
+     * engine reaches {@code self}: the {@code ALTERNATIVE} siblings of {@code self} and of every
+     * sub-flow on the way up to the top-level flow. Condition authenticators and disabled
+     * executions are ignored.
+     *
+     * @return the execution ids, or {@code null} if a {@code REQUIRED} or {@code CONDITIONAL}
+     *         execution would have to be skipped (then nothing may be skipped at all)
      */
-    static void skipSiblings(AuthenticationFlowContext context) {
-        AuthenticationExecutionModel self = context.getExecution();
-        AuthenticationSessionModel authSession = context.getAuthenticationSession();
-        context.getRealm().getAuthenticationExecutionsStream(self.getParentFlow())
-                .filter(e -> !e.getId().equals(self.getId()))
-                .forEach(e -> authSession.setExecutionStatus(e.getId(), ExecutionStatus.ATTEMPTED));
+    static List<String> executionsToSkip(KeycloakSession session, RealmModel realm, AuthenticationExecutionModel self) {
+        List<String> skip = new ArrayList<>();
+        AuthenticationExecutionModel current = self;
+        while (true) {
+            String parentFlowId = current.getParentFlow();
+            for (AuthenticationExecutionModel sibling : realm.getAuthenticationExecutionsStream(parentFlowId).toList()) {
+                if (sibling.getId().equals(current.getId()) || sibling.isDisabled() || isCondition(session, sibling)) {
+                    continue;
+                }
+                if (!current.isAlternative() || !sibling.isAlternative()) {
+                    // current is part of a sequence, or sits next to a mandatory step
+                    return null;
+                }
+                skip.add(sibling.getId());
+            }
+            AuthenticationFlowModel parentFlow = realm.getAuthenticationFlowById(parentFlowId);
+            if (parentFlow == null) {
+                return null;
+            }
+            if (parentFlow.isTopLevel()) {
+                return skip;
+            }
+            current = realm.getAuthenticationExecutionByFlowId(parentFlowId);
+            if (current == null) {
+                return null;
+            }
+        }
+    }
+
+    private static boolean isCondition(KeycloakSession session, AuthenticationExecutionModel execution) {
+        if (execution.isAuthenticatorFlow() || execution.getAuthenticator() == null) {
+            return false;
+        }
+        AuthenticatorFactory factory = (AuthenticatorFactory) session.getKeycloakSessionFactory()
+                .getProviderFactory(org.keycloak.authentication.Authenticator.class, execution.getAuthenticator());
+        return factory instanceof ConditionalAuthenticatorFactory;
     }
 
     /**
-     * True for the POST the login page sends when the user picks this execution
-     * ({@code authenticationExecution=<id>} in the form body).
+     * True for the POST the login page sends when the user picks <em>this</em> execution
+     * ({@code authenticationExecution=<own id>} in the form body).
      */
-    static boolean isSelectedViaButton(HttpRequest request) {
+    static boolean isSelectedViaButton(HttpRequest request, AuthenticationExecutionModel self) {
         if (!HttpMethod.POST.equalsIgnoreCase(request.getHttpMethod())) {
             return false;
         }
@@ -153,6 +228,6 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
             return false;
         }
         String selected = form.getFirst(Constants.AUTHENTICATION_EXECUTION);
-        return selected != null && !selected.isBlank();
+        return selected != null && self != null && selected.equals(self.getId());
     }
 }

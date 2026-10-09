@@ -3,7 +3,7 @@
 End-to-end test for sit-auth-spnego-button against a running Keycloak and a real KDC.
 
 Configures a realm through the admin API (Kerberos user federation with the keytab from
-setup-kdc.sh, a browser flow with the on-demand Kerberos execution before the forms, a
+setup-kdc.sh, a browser flow with the on-demand Kerberos execution after the forms, a
 public client) and then plays the login the way a browser does, with curl:
 
   A. kinit alice -> login page -> "try another way" lists the execution -> select it
@@ -11,6 +11,11 @@ public client) and then plays the login the way a browser does, with curl:
      -> code exchanged, token says preferred_username=alice
   B. no ticket -> same selection -> 401 with Keycloak's fallback form -> fallback POST
      -> password form (no "page expired")
+  D. conditional placement: ALTERNATIVE sub-flow > CONDITIONAL sub-flow > condition +
+     button REQUIRED. Condition true: offered, login with ticket, fallback without ticket.
+     Condition false: not offered, a forged selection is not accepted.
+  E. safety: a REQUIRED step next to the button (e.g. OTP after it) must not be skipped:
+     the click is refused, no Negotiate, no login with a ticket.
   C. the built-in auth-spnego selected the same way -> "page expired"
      (documents the Keycloak behaviour this provider works around; if this check ever
      fails, Keycloak fixed it upstream and the provider may be retired)
@@ -39,6 +44,8 @@ CLIENT_ID = "e2e-client"
 REDIRECT_URI = BASE + "/e2e/callback"
 FLOW_BUTTON = "e2e-browser-button"
 FLOW_BUILTIN = "e2e-browser-builtin"
+FLOW_NESTED = "e2e-browser-nested"
+FLOW_GUARDED = "e2e-browser-guarded"
 PROVIDER_BUTTON = "sit-auth-spnego-button"
 PROVIDER_BUILTIN = "auth-spnego"
 
@@ -189,6 +196,8 @@ def setup_realm(t):
     execs = {}
     execs[FLOW_BUTTON] = build_flow(t, FLOW_BUTTON, PROVIDER_BUTTON, before_forms=False)
     execs[FLOW_BUILTIN] = build_flow(t, FLOW_BUILTIN, PROVIDER_BUILTIN, before_forms=False)
+    execs[FLOW_NESTED] = build_nested_flow(t, FLOW_NESTED)
+    execs[FLOW_GUARDED] = build_nested_flow(t, FLOW_GUARDED, step_after_button="auth-otp-form")
     return execs
 
 
@@ -238,6 +247,73 @@ def build_flow(t, name, provider, before_forms):
     return target["id"]
 
 
+def build_nested_flow(t, name, step_after_button=None):
+    """Copy of the browser flow with the button behind a condition:
+         forms ALT | <name>-kerberos ALT > <name>-intern CONDITIONAL > client-scope condition
+         REQUIRED + button REQUIRED [+ step_after_button REQUIRED] | passkey ALT
+    The condition is "client requests scope 'profile'" (a default scope, so true); it stands in
+    for a network condition. Returns (button execution id, condition config id)."""
+    r = "/admin/realms/" + REALM
+    api("POST", r + "/authentication/flows/browser/copy", {"newName": name}, token=t)
+    q = urllib.parse.quote
+    path = r + "/authentication/flows/%s/executions" % q(name)
+
+    def all_execs():
+        execs, _ = api("GET", path, token=t)
+        return execs
+
+    def update(execution, **changes):
+        rep = dict(execution)
+        rep.update(changes)
+        api("PUT", path, rep, token=t)
+
+    builtin = next(e for e in all_execs() if e.get("providerId") == PROVIDER_BUILTIN)
+    update(builtin, requirement="DISABLED")
+
+    wrap, intern = name + "-kerberos", name + "-intern"
+    api("POST", path + "/flow", {"alias": wrap, "type": "basic-flow", "provider": "registration-page-form",
+                                 "description": "Kerberos (wrapper)"}, token=t)
+    api("POST", r + "/authentication/flows/%s/executions/flow" % q(wrap),
+        {"alias": intern, "type": "basic-flow", "provider": "registration-page-form", "description": "Kerberos intern"}, token=t)
+    for provider in ["conditional-client-scope", PROVIDER_BUTTON] + ([step_after_button] if step_after_button else []):
+        api("POST", r + "/authentication/flows/%s/executions/execution" % q(intern), {"provider": provider}, token=t)
+    api("POST", path + "/execution", {"provider": "webauthn-authenticator-passwordless"}, token=t)
+
+    execs = all_execs()
+    by_name = lambda n: next(e for e in execs if e.get("displayName") == n and e.get("authenticationFlow"))
+    start = next(i for i, e in enumerate(execs) if e.get("displayName") == intern and e.get("authenticationFlow"))
+    # providers inside the intern sub-flow (the copied browser flow has its own OTP form elsewhere)
+    by_provider = lambda pid: next(e for e in execs[start + 1:] if e.get("providerId") == pid)
+    update(by_name(wrap), requirement="ALTERNATIVE")
+    update(by_name(intern), requirement="CONDITIONAL")
+    update(by_provider("conditional-client-scope"), requirement="REQUIRED")
+    update(by_provider(PROVIDER_BUTTON), requirement="REQUIRED")
+    if step_after_button:
+        update(by_provider(step_after_button), requirement="REQUIRED")
+    update(by_provider("webauthn-authenticator-passwordless"), requirement="ALTERNATIVE")
+
+    cond = by_provider("conditional-client-scope")
+    _, location = api("POST", r + "/authentication/executions/%s/config" % cond["id"],
+                      {"alias": name + "-cond", "config": {"client_scope": "profile", "negate": "false"}}, token=t)
+    config_id = (location or "").rstrip("/").split("/")[-1]
+    if not config_id:
+        raise RuntimeError("no Location for the condition config")
+
+    execs = all_execs()
+    order = [(e.get("level"), e.get("providerId") or e.get("displayName"), e["requirement"]) for e in execs]
+    names = [o[1] for o in order]
+    assert names.index(wrap) > next(i for i, e in enumerate(execs) if "forms" in e.get("displayName", "").lower()), order
+    if os.environ.get("E2E_DEBUG"):
+        print("  %s: %s" % (name, order))
+    return by_provider(PROVIDER_BUTTON)["id"], config_id
+
+
+def set_condition(t, config_id, name, holds):
+    api("PUT", "/admin/realms/%s/authentication/config/%s" % (REALM, config_id),
+        {"id": config_id, "alias": name + "-cond",
+         "config": {"client_scope": "profile", "negate": "false" if holds else "true"}}, token=t)
+
+
 def bind_flow(t, name):
     api("PUT", "/admin/realms/" + REALM, {"browserFlow": name}, token=t)
 
@@ -259,7 +335,7 @@ def open_login_and_select(b, exec_id):
     return selection_form(body, exec_id)
 
 
-def scenario_a(exec_id):
+def scenario_a(exec_id, p="A"):
     kinit()
     b = Browser()
     state = {}
@@ -267,7 +343,7 @@ def scenario_a(exec_id):
     def offered():
         state["action"] = open_login_and_select(b, exec_id)
         return "listed in authenticationSelections"
-    if not check("A1 execution offered on the login page", offered):
+    if not check(p + "1 execution offered on the login page", offered):
         return
 
     def redirect():
@@ -282,7 +358,7 @@ def scenario_a(exec_id):
             raise RuntimeError("refresh URL lacks client_id/tab_id: " + loc)
         state["refresh"] = loc
         return "303 -> refresh URL without session_code/execution"
-    if not check("A2 selection answers with a redirect to the refresh URL", redirect):
+    if not check(p + "2 selection answers with a redirect to the refresh URL", redirect):
         return
 
     def challenge():
@@ -292,7 +368,7 @@ def scenario_a(exec_id):
         if "<FORM METHOD=\"POST\"" not in body:
             raise RuntimeError("401 without the fallback form")
         return "401 WWW-Authenticate: Negotiate (with fallback form)"
-    if not check("A3 refresh GET challenges with Negotiate", challenge):
+    if not check(p + "3 refresh GET challenges with Negotiate", challenge):
         return
 
     def negotiate():
@@ -304,7 +380,7 @@ def scenario_a(exec_id):
             raise RuntimeError("unexpected Location " + loc)
         state["code"] = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
         return "retry with ticket -> 302 with authorization code"
-    if not check("A4 retry of the refresh GET with the ticket logs in", negotiate):
+    if not check(p + "4 retry of the refresh GET with the ticket logs in", negotiate):
         return
 
     def token():
@@ -317,10 +393,10 @@ def scenario_a(exec_id):
         if claims.get("preferred_username") != "alice":
             raise RuntimeError("token for %r, expected alice" % claims.get("preferred_username"))
         return "preferred_username=alice"
-    check("A5 authorization code yields a token for the Kerberos user", token)
+    check(p + "5 authorization code yields a token for the Kerberos user", token)
 
 
-def scenario_b(exec_id):
+def scenario_b(exec_id, p="B"):
     kdestroy()
     b = Browser()
     state = {}
@@ -332,7 +408,7 @@ def scenario_b(exec_id):
             raise RuntimeError("HTTP %d instead of 303" % status)
         state["refresh"] = headers["location"]
         return "303"
-    if not check("B1 selection without a ticket also redirects", select):
+    if not check(p + "1 selection without a ticket also redirects", select):
         return
 
     def fallback():
@@ -344,7 +420,7 @@ def scenario_b(exec_id):
             raise RuntimeError("no fallback form in the 401 body")
         state["fallback"] = html.unescape(m.group(1))
         return "401 Negotiate with fallback form"
-    if not check("B2 refresh GET without ticket returns the fallback form", fallback):
+    if not check(p + "2 refresh GET without ticket returns the fallback form", fallback):
         return
 
     def password_form():
@@ -355,7 +431,7 @@ def scenario_b(exec_id):
             raise RuntimeError("page expired instead of the password form")
         state["form"] = body
         return "password form rendered"
-    if not check("B3 fallback POST lands on the password form", password_form):
+    if not check(p + "3 fallback POST lands on the password form", password_form):
         return
 
     def offered_again():
@@ -365,7 +441,63 @@ def scenario_b(exec_id):
             raise RuntimeError("HTTP %d" % status)
         selection_form(body, exec_id)
         return "execution offered again after the fallback"
-    check("B4 the Kerberos option is offered again after the fallback", offered_again)
+    check(p + "4 the Kerberos option is offered again after the fallback", offered_again)
+
+
+def scenario_d_off(t, exec_id, config_id):
+    """Condition false: the button is not offered and a forged selection is not accepted."""
+    set_condition(t, config_id, FLOW_NESTED, holds=False)
+    kinit()
+    b = Browser()
+    state = {}
+
+    def hidden():
+        status, _, body, _ = b.request("GET", auth_url())
+        action = form_action(body, "kc-select-try-another-way-form")
+        status, _, body, _ = b.request("POST", action, data={"tryAnotherWay": "on"})
+        if status != 200:
+            raise RuntimeError("HTTP %d" % status)
+        if exec_id in body:
+            raise RuntimeError("button offered although the condition is false")
+        state["page"] = body
+        return "not offered"
+    if not check("D6 condition false: button not offered", hidden):
+        return
+
+    def forged():
+        # every option of the select page posts to the same action URL; use the first one
+        m = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(?:(?!</form>).)*name="authenticationExecution"', state["page"], re.S)
+        if not m:
+            raise RuntimeError("no selection form on the page")
+        action = html.unescape(m.group(1))
+        status, headers, body, _ = b.request("POST", action, data={"authenticationExecution": exec_id})
+        if status in (303, 401) or headers.get("www-authenticate"):
+            raise RuntimeError("forged selection accepted: HTTP %d %s" % (status, headers.get("location", "")))
+        status, headers, _, _ = b.request("GET", auth_url(), negotiate=True)
+        if status == 302 and "code=" in headers.get("location", ""):
+            raise RuntimeError("logged in via Kerberos although the condition is false")
+        return "HTTP %d, no Negotiate, no login" % status
+    check("D7 condition false: forged selection not accepted", forged)
+    set_condition(t, config_id, FLOW_NESTED, holds=True)
+
+
+def scenario_e(exec_id):
+    """Button REQUIRED with another REQUIRED step (OTP) after it in the same sub-flow: skipping
+    would bypass the OTP. The click must be refused."""
+    kinit()
+    b = Browser()
+
+    def refused():
+        action = open_login_and_select(b, exec_id)
+        status, headers, body, _ = b.request("POST", action, data={"authenticationExecution": exec_id})
+        if status == 303:
+            status, headers, body, _ = b.request("GET", headers["location"], negotiate=True)
+        if status == 401 or headers.get("www-authenticate"):
+            raise RuntimeError("Negotiate sent although a mandatory step would be skipped")
+        if status == 302 and "code=" in headers.get("location", ""):
+            raise RuntimeError("logged in without the OTP step")
+        return "click refused (HTTP %d), no Negotiate, no login" % status
+    check("E1 a REQUIRED step next to the button is never skipped", refused)
 
 
 def scenario_c(exec_id):
@@ -390,11 +522,20 @@ def scenario_c(exec_id):
 def main():
     t = admin_token()
     execs = setup_realm(t)
-    print("realm %s configured: %s=%s %s=%s" % (REALM, FLOW_BUTTON, execs[FLOW_BUTTON], FLOW_BUILTIN, execs[FLOW_BUILTIN]))
+    print("realm %s configured: %s" % (REALM, execs))
 
     bind_flow(t, FLOW_BUTTON)
     scenario_a(execs[FLOW_BUTTON])
     scenario_b(execs[FLOW_BUTTON])
+
+    nested_id, nested_cfg = execs[FLOW_NESTED]
+    bind_flow(t, FLOW_NESTED)
+    scenario_a(nested_id, p="D")
+    scenario_b(nested_id, p="DB")
+    scenario_d_off(t, nested_id, nested_cfg)
+
+    bind_flow(t, FLOW_GUARDED)
+    scenario_e(execs[FLOW_GUARDED][0])
 
     bind_flow(t, FLOW_BUILTIN)
     scenario_c(execs[FLOW_BUILTIN])

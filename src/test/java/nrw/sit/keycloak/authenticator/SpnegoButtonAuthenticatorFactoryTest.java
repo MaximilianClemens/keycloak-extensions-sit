@@ -60,8 +60,8 @@ class SpnegoButtonAuthenticatorFactoryTest {
             assertSame(SpnegoButtonAuthenticator.SINGLETON, factory.create(mock(KeycloakSession.class)));
             assertTrue(choices.contains(Requirement.ALTERNATIVE));
             assertTrue(choices.contains(Requirement.DISABLED));
-            // On demand makes no sense as REQUIRED; the built-in authenticator covers that.
-            assertFalse(choices.contains(Requirement.REQUIRED));
+            // REQUIRED only for the conditional placement (single step of a CONDITIONAL sub-flow)
+            assertTrue(choices.contains(Requirement.REQUIRED));
             assertFalse(choices.contains(Requirement.CONDITIONAL));
         } else {
             assertSame(SpnegoButtonAuthenticatorFactory.SINGLETON_DISABLED, factory.create(mock(KeycloakSession.class)));

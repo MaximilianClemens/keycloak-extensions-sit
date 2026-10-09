@@ -8,15 +8,20 @@ import org.junit.jupiter.api.Test;
 import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.authentication.AuthenticationFlowError;
 import org.keycloak.authentication.AuthenticationProcessor;
+import org.keycloak.authentication.Authenticator;
+import org.keycloak.authentication.authenticators.conditional.ConditionalRoleAuthenticatorFactory;
 import org.keycloak.authentication.FlowStatus;
 import org.keycloak.authentication.authenticators.browser.SpnegoAuthenticator;
 import org.keycloak.events.Errors;
 import org.keycloak.events.EventBuilder;
 import org.keycloak.http.HttpRequest;
 import org.keycloak.models.AuthenticationExecutionModel;
+import org.keycloak.models.AuthenticationExecutionModel.Requirement;
+import org.keycloak.models.AuthenticationFlowModel;
 import org.keycloak.models.Constants;
 import org.keycloak.models.CredentialValidationOutput;
 import org.keycloak.models.KeycloakSession;
+import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserCredentialModel;
 import org.keycloak.models.UserModel;
@@ -28,12 +33,14 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
 import java.net.URI;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -59,9 +66,10 @@ class SpnegoButtonAuthenticatorTest {
     private final AuthenticationFlowContext context = mock(AuthenticationFlowContext.class);
     private final AuthenticationSessionModel authSession = mock(AuthenticationSessionModel.class);
     private final RootAuthenticationSessionModel rootSession = mock(RootAuthenticationSessionModel.class);
-    private final AuthenticationExecutionModel execution = mock(AuthenticationExecutionModel.class);
-    private final AuthenticationExecutionModel cookie = mock(AuthenticationExecutionModel.class);
-    private final AuthenticationExecutionModel forms = mock(AuthenticationExecutionModel.class);
+    private final AuthenticationExecutionModel execution = exec("krb-exec-id", "browser-flow-id", Requirement.ALTERNATIVE, "sit-auth-spnego-button");
+    private final AuthenticationExecutionModel cookie = exec("cookie-exec-id", "browser-flow-id", Requirement.ALTERNATIVE, "auth-cookie");
+    private final AuthenticationExecutionModel forms = flowExec("forms-exec-id", "browser-flow-id", Requirement.ALTERNATIVE, "forms-flow-id");
+    private final KeycloakSessionFactory sessionFactory = mock(KeycloakSessionFactory.class);
     private final RealmModel realm = mock(RealmModel.class);
     private final KeycloakSession session = mock(KeycloakSession.class);
     private final UserProvider users = mock(UserProvider.class);
@@ -85,6 +93,8 @@ class SpnegoButtonAuthenticatorTest {
         when(context.getActionUrl("code")).thenReturn(ACTION_URL);
 
         when(session.users()).thenReturn(users);
+        when(session.getKeycloakSessionFactory()).thenReturn(sessionFactory);
+        when(sessionFactory.getProviderFactory(Authenticator.class, "condition-x")).thenReturn(new ConditionalRoleAuthenticatorFactory());
 
         when(authSession.getParentSession()).thenReturn(rootSession);
         when(authSession.getRequiredActions()).thenReturn(Set.of());
@@ -94,13 +104,55 @@ class SpnegoButtonAuthenticatorTest {
         when(request.getDecodedFormParameters()).thenReturn(form);
         when(headers.getRequestHeaders()).thenReturn(requestHeaders);
 
-        when(execution.isRequired()).thenReturn(false);
-        when(execution.getId()).thenReturn("krb-exec-id");
-        when(execution.getParentFlow()).thenReturn("browser-flow-id");
-        when(cookie.getId()).thenReturn("cookie-exec-id");
-        when(forms.getId()).thenReturn("forms-exec-id");
         when(realm.getAuthenticationExecutionsStream("browser-flow-id"))
-                .thenAnswer(inv -> Stream.of(cookie, execution, forms));
+                .thenAnswer(inv -> Stream.of(cookie, forms, execution));
+        when(realm.getAuthenticationFlowById("browser-flow-id")).thenReturn(flow("browser-flow-id", true));
+    }
+
+    private static AuthenticationExecutionModel exec(String id, String parent, Requirement requirement, String authenticator) {
+        AuthenticationExecutionModel model = new AuthenticationExecutionModel();
+        model.setId(id);
+        model.setParentFlow(parent);
+        model.setRequirement(requirement);
+        model.setAuthenticator(authenticator);
+        return model;
+    }
+
+    private static AuthenticationExecutionModel flowExec(String id, String parent, Requirement requirement, String flowId) {
+        AuthenticationExecutionModel model = exec(id, parent, requirement, null);
+        model.setAuthenticatorFlow(true);
+        model.setFlowId(flowId);
+        return model;
+    }
+
+    private static AuthenticationFlowModel flow(String id, boolean topLevel) {
+        AuthenticationFlowModel model = new AuthenticationFlowModel();
+        model.setId(id);
+        model.setAlias(id);
+        model.setTopLevel(topLevel);
+        return model;
+    }
+
+    /**
+     * browser-flow: cookie ALT | forms ALT | kerberos-wrap ALT
+     *   kerberos-wrap: intern CONDITIONAL
+     *     intern: condition REQUIRED | [extra] | button REQUIRED
+     */
+    private AuthenticationExecutionModel nestedButton(AuthenticationExecutionModel... extraInIntern) {
+        AuthenticationExecutionModel wrap = flowExec("wrap-exec-id", "browser-flow-id", Requirement.ALTERNATIVE, "wrap-flow-id");
+        AuthenticationExecutionModel intern = flowExec("intern-exec-id", "wrap-flow-id", Requirement.CONDITIONAL, "intern-flow-id");
+        AuthenticationExecutionModel condition = exec("cond-exec-id", "intern-flow-id", Requirement.REQUIRED, "condition-x");
+        AuthenticationExecutionModel button = exec("krb-nested-id", "intern-flow-id", Requirement.REQUIRED, "sit-auth-spnego-button");
+
+        when(realm.getAuthenticationExecutionsStream("browser-flow-id")).thenAnswer(inv -> Stream.of(cookie, forms, wrap));
+        when(realm.getAuthenticationExecutionsStream("wrap-flow-id")).thenAnswer(inv -> Stream.of(intern));
+        when(realm.getAuthenticationExecutionsStream("intern-flow-id"))
+                .thenAnswer(inv -> Stream.concat(Stream.of(condition), Stream.concat(Stream.of(extraInIntern), Stream.of(button))));
+        when(realm.getAuthenticationFlowById("wrap-flow-id")).thenReturn(flow("wrap-flow-id", false));
+        when(realm.getAuthenticationFlowById("intern-flow-id")).thenReturn(flow("intern-flow-id", false));
+        when(realm.getAuthenticationExecutionByFlowId("wrap-flow-id")).thenReturn(wrap);
+        when(realm.getAuthenticationExecutionByFlowId("intern-flow-id")).thenReturn(intern);
+        return button;
     }
 
     // ── phase 0: nothing requested ───────────────────────────────────────────
@@ -187,6 +239,7 @@ class SpnegoButtonAuthenticatorTest {
 
     @Test
     void anInvalidTicketIsRejectedAndTheFlowResetToTheLoginForm() {
+        when(authSession.getAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE)).thenReturn("true");
         requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "Negotiate YIIbad");
         when(users.getUserByCredential(any(), any()))
                 .thenReturn(new CredentialValidationOutput(null, CredentialValidationOutput.Status.FAILED, Map.of()));
@@ -203,6 +256,7 @@ class SpnegoButtonAuthenticatorTest {
 
     @Test
     void aTicketNobodyCanValidateFallsBackToTheLoginForm() {
+        when(authSession.getAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE)).thenReturn("true");
         requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "Negotiate YIIabc");
         when(users.getUserByCredential(any(), any())).thenReturn(null);
         when(context.getStatus()).thenReturn(FlowStatus.ATTEMPTED);
@@ -215,6 +269,7 @@ class SpnegoButtonAuthenticatorTest {
 
     @Test
     void aValidTicketDoesNotResetTheFlow() {
+        when(authSession.getAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE)).thenReturn("true");
         requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "Negotiate YIIabc");
         when(users.getUserByCredential(any(), any()))
                 .thenReturn(new CredentialValidationOutput(mock(UserModel.class), CredentialValidationOutput.Status.AUTHENTICATED, Map.of()));
@@ -226,17 +281,125 @@ class SpnegoButtonAuthenticatorTest {
     }
 
     @Test
-    void aTicketWinsOverAButtonSelectionInTheSameRequest() {
-        when(request.getHttpMethod()).thenReturn("POST");
-        form.putSingle(Constants.AUTHENTICATION_EXECUTION, "krb-exec-id");
+    void aNonNegotiateAnswerAfterTheClickIsTreatedLikeTheBuiltInOne() {
+        when(authSession.getAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE)).thenReturn("true");
         requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "NTLM TlRMTVNT");
+        when(context.getStatus()).thenReturn(FlowStatus.ATTEMPTED);
 
         authenticator.authenticate(context);
 
-        // built-in behaviour for a non-Negotiate scheme: attempted, no reset, no redirect
         verify(context).attempted();
+        verify(context).resetFlow();
+        verify(users, never()).getUserByCredential(any(), any());
+    }
+
+    // ── fix: a ticket is only evaluated after the user clicked ───────────────
+
+    @Test
+    void aTicketWithoutAClickIsIgnored() {
+        requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "Negotiate YIIabc");
+
+        authenticator.authenticate(context);
+
+        verify(users, never()).getUserByCredential(any(), any());
+        verify(context, never()).success(anyString());
+        verify(context, never()).setUser(any());
+        verify(context).attempted();
+    }
+
+    @Test
+    void aHeaderOnTheClickItselfDoesNotSkipTheRedirect() {
+        when(request.getHttpMethod()).thenReturn("POST");
+        form.putSingle(Constants.AUTHENTICATION_EXECUTION, "krb-exec-id");
+        requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "Negotiate YIIabc");
+
+        authenticator.authenticate(context);
+
+        verify(users, never()).getUserByCredential(any(), any());
+        verify(authSession).setAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE, "true");
+        ArgumentCaptor<Response> captor = ArgumentCaptor.forClass(Response.class);
+        verify(context).challenge(captor.capture());
+        assertEquals(Response.Status.SEE_OTHER.getStatusCode(), captor.getValue().getStatus());
+    }
+
+    // ── fix: only a click on this very execution counts ──────────────────────
+
+    @Test
+    void aSelectionOfAnotherExecutionIsNotAClick() {
+        when(request.getHttpMethod()).thenReturn("POST");
+        form.putSingle(Constants.AUTHENTICATION_EXECUTION, "passkey-exec-id");
+
+        authenticator.authenticate(context);
+
         verify(authSession, never()).clearExecutionStatus();
+        verify(authSession, never()).setAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE, "true");
         verify(context, never()).challenge(any());
+        verify(context).attempted();
+    }
+
+    // ── fix: never skip a mandatory step ─────────────────────────────────────
+
+    @Test
+    void refusesTheClickNextToAConditionalSibling() {
+        AuthenticationExecutionModel otp = flowExec("otp-exec-id", "browser-flow-id", Requirement.CONDITIONAL, "otp-flow-id");
+        when(realm.getAuthenticationExecutionsStream("browser-flow-id")).thenAnswer(inv -> Stream.of(cookie, forms, otp, execution));
+        when(request.getHttpMethod()).thenReturn("POST");
+        form.putSingle(Constants.AUTHENTICATION_EXECUTION, "krb-exec-id");
+
+        authenticator.authenticate(context);
+
+        verify(authSession, never()).clearExecutionStatus();
+        verify(authSession, never()).setExecutionStatus(anyString(), any());
+        verify(authSession, never()).setAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE, "true");
+        verify(context, never()).challenge(any());
+        verify(context).attempted();
+    }
+
+    @Test
+    void refusesWhenTheButtonIsRequiredNextToARequiredStep() {
+        AuthenticationExecutionModel required = exec("krb-exec-id", "browser-flow-id", Requirement.REQUIRED, "sit-auth-spnego-button");
+        AuthenticationExecutionModel password = exec("pw-exec-id", "browser-flow-id", Requirement.REQUIRED, "auth-username-password-form");
+        when(realm.getAuthenticationExecutionsStream("browser-flow-id")).thenAnswer(inv -> Stream.of(password, required));
+
+        assertNull(SpnegoButtonAuthenticator.executionsToSkip(session, realm, required));
+    }
+
+    @Test
+    void ignoresDisabledSiblings() {
+        AuthenticationExecutionModel off = exec("off-exec-id", "browser-flow-id", Requirement.DISABLED, "auth-spnego");
+        when(realm.getAuthenticationExecutionsStream("browser-flow-id")).thenAnswer(inv -> Stream.of(cookie, off, forms, execution));
+
+        assertEquals(List.of("cookie-exec-id", "forms-exec-id"), SpnegoButtonAuthenticator.executionsToSkip(session, realm, execution));
+    }
+
+    @Test
+    void nestedConditionalPlacementSkipsOnlyTheTopLevelAlternatives() {
+        AuthenticationExecutionModel button = nestedButton();
+
+        // the condition next to the button is not a step; wrap/intern lie on the path itself
+        assertEquals(List.of("cookie-exec-id", "forms-exec-id"), SpnegoButtonAuthenticator.executionsToSkip(session, realm, button));
+    }
+
+    @Test
+    void nestedConditionalPlacementRefusesWhenTheSubFlowHasAnotherStep() {
+        AuthenticationExecutionModel otp = exec("otp-exec-id", "intern-flow-id", Requirement.REQUIRED, "auth-otp-form");
+        AuthenticationExecutionModel button = nestedButton(otp);
+
+        assertNull(SpnegoButtonAuthenticator.executionsToSkip(session, realm, button));
+    }
+
+    @Test
+    void requiredInTheNestedPlacementStillGetsTheFallbackFormNotAnErrorPage() {
+        AuthenticationExecutionModel button = nestedButton();
+        when(context.getExecution()).thenReturn(button);
+        when(authSession.getAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE)).thenReturn("true");
+
+        authenticator.authenticate(context);
+
+        ArgumentCaptor<Response> captor = ArgumentCaptor.forClass(Response.class);
+        verify(context).forceChallenge(captor.capture());
+        assertEquals(Response.Status.UNAUTHORIZED.getStatusCode(), captor.getValue().getStatus());
+        assertTrue(String.valueOf(captor.getValue().getEntity()).contains(ACTION_URL.toString()));
     }
 
     // ── fallback form / action ───────────────────────────────────────────────
@@ -252,31 +415,30 @@ class SpnegoButtonAuthenticatorTest {
     }
 
     @Test
-    void skipSiblingsLeavesTheOwnExecutionAlone() {
-        SpnegoButtonAuthenticator.skipSiblings(context);
-
-        verify(authSession).setExecutionStatus("cookie-exec-id", ExecutionStatus.ATTEMPTED);
-        verify(authSession).setExecutionStatus("forms-exec-id", ExecutionStatus.ATTEMPTED);
-        verify(authSession, never()).setExecutionStatus(eq("krb-exec-id"), any());
+    void skipsTheAlternativeSiblingsButNotItself() {
+        assertEquals(List.of("cookie-exec-id", "forms-exec-id"), SpnegoButtonAuthenticator.executionsToSkip(session, realm, execution));
     }
 
     // ── selection detection ──────────────────────────────────────────────────
 
     @Test
     void detectsTheAuthenticationSelectionPost() {
-        assertFalse(SpnegoButtonAuthenticator.isSelectedViaButton(request), "GET is never a selection");
+        assertFalse(SpnegoButtonAuthenticator.isSelectedViaButton(request, execution), "GET is never a selection");
 
         when(request.getHttpMethod()).thenReturn("POST");
-        assertFalse(SpnegoButtonAuthenticator.isSelectedViaButton(request), "POST without the field");
+        assertFalse(SpnegoButtonAuthenticator.isSelectedViaButton(request, execution), "POST without the field");
 
         form.putSingle(Constants.AUTHENTICATION_EXECUTION, " ");
-        assertFalse(SpnegoButtonAuthenticator.isSelectedViaButton(request), "blank field");
+        assertFalse(SpnegoButtonAuthenticator.isSelectedViaButton(request, execution), "blank field");
+
+        form.putSingle(Constants.AUTHENTICATION_EXECUTION, "other-exec-id");
+        assertFalse(SpnegoButtonAuthenticator.isSelectedViaButton(request, execution), "another execution");
 
         form.putSingle(Constants.AUTHENTICATION_EXECUTION, "krb-exec-id");
-        assertTrue(SpnegoButtonAuthenticator.isSelectedViaButton(request));
+        assertTrue(SpnegoButtonAuthenticator.isSelectedViaButton(request, execution));
 
         when(request.getDecodedFormParameters()).thenReturn(null);
-        assertFalse(SpnegoButtonAuthenticator.isSelectedViaButton(request), "no form body");
+        assertFalse(SpnegoButtonAuthenticator.isSelectedViaButton(request, execution), "no form body");
     }
 
     @Test

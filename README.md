@@ -192,14 +192,25 @@ request whose retry is harmless, a `GET` of the flow's refresh URL (no `session_
 | Request | What happens |
 |---|---|
 | first pass of the flow | the execution sits after the forms, so it is never reached; being unprocessed, it is listed in `authenticationSelections` (Keycloak drops executions that already reported *attempted*) |
-| `POST` with `authenticationExecution=<this>` (button) | `AuthenticationProcessor.resetFlow()`, every sibling execution of the parent flow marked `ATTEMPTED` (so the next pass skips the forms), auth note `sit.spnego-button.requested=true`, `303` to `getRefreshUrl()` |
-| `GET` refresh URL, note set | built-in behaviour: `401 Negotiate` with Keycloak's auto-submitting fallback form in the body |
+| `POST` with `authenticationExecution=<this>` (button) | `AuthenticationProcessor.resetFlow()`, the `ALTERNATIVE` siblings on the way up to the top-level flow marked `ATTEMPTED` (so the next pass skips the forms), auth note `sit.spnego-button.requested=true`, `303` to `getRefreshUrl()` |
+| `GET` refresh URL, note set | `401 Negotiate` with Keycloak's auto-submitting fallback form in the body (also when the execution is `REQUIRED` inside a conditional sub-flow) |
 | browser retry of that `GET` with `Authorization: Negotiate …` | built-in validation through the Kerberos user federation provider; a rejected ticket resets the flow back to the password form |
+| any request with an `Authorization` header but without a prior click | header ignored, Kerberos stays on demand |
 | no ticket: fallback form posts to this execution | `action()` resets the flow; the password form renders and the option is offered again |
 
 Ticket validation, keytab handling and user lookup are untouched; the Kerberos settings live
 in the LDAP/Kerberos user federation provider as before. The factory reports the `kerberos`
-reference category like the built-in one and offers `ALTERNATIVE` and `DISABLED` only.
+reference category like the built-in one and offers `ALTERNATIVE`, `REQUIRED` (only for the
+conditional placement below) and `DISABLED`.
+
+Safety rules:
+
+- A click only counts if the selection names this very execution.
+- Only `ALTERNATIVE` executions are skipped. If a `REQUIRED` or `CONDITIONAL` sibling (anything
+  except condition authenticators) sits on the way to the top-level flow, the click is refused
+  with a warning in the log and nothing is skipped. (Keycloak itself would then fail the
+  login instead of skipping the step; the refusal turns that into a clean fallback.)
+- An `Authorization` header is only evaluated after the user clicked the button.
 
 ### Flow
 
@@ -218,6 +229,26 @@ The position matters in both directions. Placed *before* the forms, the executio
 first pass, reports *attempted* and is no longer offered on the login page. Placed *after*
 them, it is offered, and the button click takes care of being reached on the next pass by
 skipping its siblings. Leave the built-in *Kerberos* execution `DISABLED` (or remove it).
+
+### Only under a condition (e.g. internal network)
+
+```
+Browser flow
+├─ …
+├─ Forms                         ALTERNATIVE
+│  └─ …
+└─ Kerberos                      ALTERNATIVE   (sub-flow, after the forms)
+   └─ Kerberos intern            CONDITIONAL   (sub-flow)
+      ├─ <condition>             REQUIRED
+      └─ SIT: Kerberos (on demand) REQUIRED
+```
+
+Both sub-flows are needed: Keycloak evaluates conditions only in a `CONDITIONAL` sub-flow, and
+a `CONDITIONAL` sub-flow directly in the top-level flow would make Keycloak ignore all
+top-level alternatives (cookie, forms, …). If the condition is false, the button is not
+offered and a forged selection is rejected by Keycloak. Nothing else may sit next to the
+button in the conditional sub-flow (the click would be refused). The e2e test covers this
+placement with a client-scope condition as stand-in.
 
 ### Theme
 
