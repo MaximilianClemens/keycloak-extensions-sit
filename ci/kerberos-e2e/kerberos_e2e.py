@@ -11,10 +11,10 @@ public client) and then plays the login the way a browser does, with curl:
      -> code exchanged, token says preferred_username=alice
   B. no ticket -> same selection -> 401 with Keycloak's fallback form -> fallback POST
      -> password form (no "page expired")
-  D. conditional placement: ALTERNATIVE sub-flow > CONDITIONAL sub-flow > condition +
+  F. conditional placement: ALTERNATIVE sub-flow > CONDITIONAL sub-flow > condition +
      button REQUIRED. Condition true: offered, login with ticket, fallback without ticket.
      Condition false: not offered, a forged selection is not accepted.
-  E. safety: a REQUIRED step next to the button (e.g. OTP after it) must not be skipped:
+  G. safety: a REQUIRED step next to the button (e.g. OTP after it) must not be skipped:
      the click is refused, no Negotiate, no login with a ticket.
   C. the built-in auth-spnego selected the same way -> "page expired"
      (documents the Keycloak behaviour this provider works around; if this check ever
@@ -444,7 +444,7 @@ def scenario_b(exec_id, p="B"):
     check(p + "4 the Kerberos option is offered again after the fallback", offered_again)
 
 
-def scenario_d_off(t, exec_id, config_id):
+def scenario_f_off(t, exec_id, config_id):
     """Condition false: the button is not offered and a forged selection is not accepted."""
     set_condition(t, config_id, FLOW_NESTED, holds=False)
     kinit()
@@ -461,7 +461,7 @@ def scenario_d_off(t, exec_id, config_id):
             raise RuntimeError("button offered although the condition is false")
         state["page"] = body
         return "not offered"
-    if not check("D6 condition false: button not offered", hidden):
+    if not check("F6 condition false: button not offered", hidden):
         return
 
     def forged():
@@ -477,11 +477,11 @@ def scenario_d_off(t, exec_id, config_id):
         if status == 302 and "code=" in headers.get("location", ""):
             raise RuntimeError("logged in via Kerberos although the condition is false")
         return "HTTP %d, no Negotiate, no login" % status
-    check("D7 condition false: forged selection not accepted", forged)
+    check("F7 condition false: forged selection not accepted", forged)
     set_condition(t, config_id, FLOW_NESTED, holds=True)
 
 
-def scenario_e(exec_id):
+def scenario_g(exec_id):
     """Button REQUIRED with another REQUIRED step (OTP) after it in the same sub-flow: skipping
     would bypass the OTP. The click must be refused."""
     kinit()
@@ -497,7 +497,7 @@ def scenario_e(exec_id):
         if status == 302 and "code=" in headers.get("location", ""):
             raise RuntimeError("logged in without the OTP step")
         return "click refused (HTTP %d), no Negotiate, no login" % status
-    check("E1 a REQUIRED step next to the button is never skipped", refused)
+    check("G1 a REQUIRED step next to the button is never skipped", refused)
 
 
 def scenario_c(exec_id):
@@ -530,12 +530,12 @@ def main():
 
     nested_id, nested_cfg = execs[FLOW_NESTED]
     bind_flow(t, FLOW_NESTED)
-    scenario_a(nested_id, p="D")
-    scenario_b(nested_id, p="DB")
-    scenario_d_off(t, nested_id, nested_cfg)
+    scenario_a(nested_id, p="F")
+    scenario_b(nested_id, p="FB")
+    scenario_f_off(t, nested_id, nested_cfg)
 
     bind_flow(t, FLOW_GUARDED)
-    scenario_e(execs[FLOW_GUARDED][0])
+    scenario_g(execs[FLOW_GUARDED][0])
 
     bind_flow(t, FLOW_BUILTIN)
     scenario_c(execs[FLOW_BUILTIN])
