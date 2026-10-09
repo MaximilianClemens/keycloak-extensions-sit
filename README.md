@@ -14,6 +14,8 @@ Built with Claude.
 | `sit-conditional-requested-loa` | Condition - Requested LOA (SIT) | Conditional | Matches on the LOA level **requested** by the client (not what has already been satisfied). Supports `equals`, `minimum`, and `maximum` operators, allowing step-up tiers to be made mutually exclusive by requested level. |
 | `sit-auth-otp-form-no-setup` | SIT: OTP Form (no self-setup) | Browser Flow | The built-in OTP Form without the fallback to OTP self-enrolment. A user without an OTP credential is not sent to *Configure OTP*; with requirement `REQUIRED` the login fails with `credentialSetupRequired` instead. For flows where OTP is provisioned by admins or an upstream process only. |
 | `sit-auth-spnego-button` | SIT: Kerberos (on demand) | Browser Flow | Kerberos/SPNEGO that the user starts from the login page (a "Sign in with Windows" button) instead of running automatically. Works around the built-in authenticator ending in *page expired* when chosen via *Try another way*. `ALTERNATIVE`, placed after the forms sub-flow. Verified end-to-end against a real KDC in CI. |
+| `sit-auth-spnego-level` | SIT: Kerberos (on demand, level from ticket) | Browser Flow | `sit-auth-spnego-button` plus the level of authentication (ACR) read from the ticket: a configured Authentication Mechanism Assurance group SID in the signature-verified Windows PAC, or an RFC 8129 authentication indicator (`pkinit`), sets the "matched" level (default 2), anything else the default level (1). Separate provider, so it can be swapped back for the plain button at any time. |
+| `sit-conditional-current-loa` | Condition - Current LOA below (SIT) | Conditional | Matches while the level reached so far in the *current* login is below the configured level. Lets a first factor that already established level 2 (smart-card Kerberos) skip the OTP step; the built-in LOA condition only looks at the requested level and at earlier sessions. |
 
 ### Protocol Mappers
 
@@ -55,8 +57,11 @@ but not executed.
 sets up a throwaway MIT KDC, starts the real Keycloak distribution with the jar, configures a
 realm through the admin API and plays the login with `curl --negotiate` (ticket accepted,
 fallback without ticket, and the upstream "page expired" behaviour of the built-in
-authenticator). `.github/workflows/kerberos-e2e.yml` runs it on every push. Needs root
-(KDC, `/etc/hosts`), so it is meant for CI runners or throwaway VMs.
+authenticator). With `krb5-pkinit` installed it also sets up PKINIT with a throwaway CA and
+checks `sit-auth-spnego-level` in a step-up flow: a PKINIT ticket (indicator `pkinit`) logs in at
+level 2 with `acr=silver` and skips OTP, a password ticket is level 1 and runs into OTP.
+`.github/workflows/kerberos-e2e.yml` runs it on every push. Needs root (KDC, `/etc/hosts`), so
+it is meant for CI runners or throwaway VMs.
 
 ---
 
@@ -309,6 +314,95 @@ for Firefox), SPN and keytab for `HTTP/<keycloak-host>` in the user's domain. A 
 prompt instead of a login means the browser refused to use SSPI for that host; a silent return
 to the password form means it sent no ticket (check `chrome://net-export`, look for
 `allows_default_credentials`).
+
+---
+
+## Level of authentication from the Kerberos ticket (`sit-auth-spnego-level`)
+
+A Kerberos service ticket does not say how the user obtained the TGT. A domain that requires
+smart cards (SCRIL) makes a password logon impossible, but that is an account policy, not
+something the service can see. Two mechanisms put that evidence into the ticket itself:
+
+- **Authentication Mechanism Assurance** (Windows Server 2008 R2+): the KDC adds a universal
+  group to the PAC when the TGT was obtained with a certificate whose issuance policy OID is
+  mapped to that group (`msDS-OIDToGroupLink`). The group is in every service ticket of that
+  logon session and in no LDAP `memberOf`. The PAC is signed with the service key.
+- **Authentication indicators** (RFC 8129, MIT krb5 1.14+/Heimdal): strings such as `pkinit`
+  the KDC adds for the pre-authentication mechanism that was used (`pkinit_indicator`), wrapped
+  in a CAMMAC (RFC 7751) in the ticket's authorization data.
+
+`SpnegoLevelAuthenticator` extends `SpnegoButtonAuthenticator` and replaces only the step
+that validates the ticket:
+
+1. It runs Keycloak's own `SPNEGOAuthenticator` (JAAS login with the keytab of the realm's
+   Kerberos-enabled user storage provider, GSS-API accept), subclassed to read the ticket's
+   authorization data through the JDK's `ExtendedGSSContext` while the context is alive.
+2. The already-authenticated context is handed to the user storage providers via
+   `KerberosConstants.AUTHENTICATED_SPNEGO_CONTEXT`, the path Keycloak itself uses for provider
+   chains, so the token is accepted exactly once (Kerberos replay cache) and user lookup is
+   unchanged.
+3. `TicketLevelEvaluator` looks for a configured AMA group SID in the PAC (`KERB_VALIDATION_INFO`:
+   domain groups, extra SIDs, resource groups) and for configured indicators. Before a PAC counts,
+   its server signature (`HMAC-SHA1-96-AES`, key usage 17) is verified with the matching key from
+   the keytab. Unverifiable evidence is logged and ignored; it never raises the level.
+4. The level is written with `AcrStore.setLevelAuthenticated()` and becomes the `acr` claim via
+   the realm's `acr.loa.map`. The user session notes `sit.kerberos.level` and
+   `sit.kerberos.evidence` (e.g. `indicator:pkinit`, `ama-group:S-1-5-21-…`) carry the decision
+   for mappers and audits.
+
+The PAC parser, the Kerberos checksum (RFC 3961 n-fold and key derivation, RFC 3962) and the
+authorization-data DER walk are in `nrw.sit.keycloak.kerberos`, dependency-free. They are
+tested against a PAC generated and signed by impacket (`ci/kerberos-e2e/gen_pac_fixture.py`)
+and the RFC 3961 test vectors; the end-to-end test verifies the signature of a PAC issued by a
+real MIT KDC.
+
+| Setting | Meaning |
+|---|---|
+| AMA group SIDs | SIDs of the AMA groups, comma separated. Empty: the PAC is ignored. |
+| Authentication indicators | Indicator names, comma separated, any match counts. Empty: ignored. |
+| Level when matched | default `2` |
+| Level otherwise | default `1` |
+
+### Flow with step-up
+
+A top-level alternative ends the flow on success, so the conditional sub-flows after it would
+never run. For step-up the Kerberos execution goes into the first-factor sub-flow, and the OTP
+sub-flow gets `sit-conditional-current-loa` next to the existing conditions:
+
+```
+Browser flow
+├─ Cookie                                        ALTERNATIVE
+└─ Login (sub-flow)                              ALTERNATIVE
+   ├─ First factor (sub-flow)                    REQUIRED
+   │  ├─ Password (sub-flow)                     ALTERNATIVE
+   │  │  └─ Username Password Form               REQUIRED
+   │  └─ SIT: Kerberos (level from ticket)       ALTERNATIVE   ← after the password sub-flow
+   ├─ Silver (sub-flow)                          CONDITIONAL
+   │  ├─ Condition - Requested LOA ≥ 2           (as before)
+   │  ├─ Condition - Current LOA below 2         ← new
+   │  └─ OTP Form                                REQUIRED
+   └─ Gold (sub-flow)                            …
+```
+
+Password login: level 1, OTP asked. Kerberos with AMA group or `pkinit` indicator: level 2,
+OTP skipped, `acr` = the realm's name for level 2. Kerberos without evidence: level 1, OTP asked.
+The Username Password Form only offers `REQUIRED`, hence its own sub-flow; because it is the
+first REQUIRED execution of that sub-flow, Keycloak also lists the parent's alternatives on the
+login page, which is what puts the Kerberos button there.
+
+### Rolling back
+
+`sit-auth-spnego-level` and `sit-auth-spnego-button` are separate providers. To go back to
+the plain button, replace the execution in the flow; nothing else changes. Without the level
+authenticator the `sit-conditional-current-loa` condition sees no level and evaluates to true,
+so the OTP step is asked as before.
+
+### Windows side
+
+AMA needs an issuance policy on the smart-card certificate template and the OID-to-group link
+(`Set-ADObject`/`msDS-OIDToGroupLink`, see Microsoft's "Authentication Mechanism Assurance"
+guide). The group must be universal and may not be used for anything else. Its SID goes into
+the authenticator configuration of that customer's realm.
 
 ---
 

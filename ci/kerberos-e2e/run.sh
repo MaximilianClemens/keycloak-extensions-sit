@@ -75,7 +75,7 @@ JAVA_OPTS_APPEND="-Djava.security.krb5.conf=/etc/krb5.conf -Dsun.security.krb5.d
     --http-port="$KC_PORT" \
     --http-management-port="$KC_MGMT_PORT" \
     --health-enabled=true \
-    --log-level=info,org.keycloak.authentication:debug,org.keycloak.federation.kerberos:debug \
+    --log-level=info,org.keycloak.authentication:debug,org.keycloak.federation.kerberos:debug,nrw.sit.keycloak:debug \
     > "$LOG" 2>&1 &
 KC_PID=$!
 
@@ -109,6 +109,17 @@ errors=$(grep -E '^[0-9-]+ [0-9:,.]+ +ERROR ' "$LOG" || true)
 if [ -n "$errors" ]; then
   echo "[e2e] ERROR lines in the Keycloak log:"; printf '%s\n' "$errors" | head -n 20
   rc=1
+fi
+# Scenario D passed: the level authenticator must have logged its decision and, since the
+# MIT KDC signs its PAC with the service key, verified that signature without complaint.
+if grep -q '^OK    D1' "$OUT"; then
+  grep -q 'Kerberos login of alice@EXAMPLE.TEST: level 2 (indicator:pkinit)' "$LOG" \
+    || { echo "[e2e] level-2 decision not found in the Keycloak log"; rc=1; }
+  grep -q 'Kerberos login of alice@EXAMPLE.TEST: level 1' "$LOG" \
+    || { echo "[e2e] level-1 decision not found in the Keycloak log"; rc=1; }
+  if grep -q 'PAC' "$LOG" && ! grep -q 'PAC server signature .* verified' "$LOG"; then
+    echo "[e2e] PAC present but no verified server signature:"; grep 'PAC' "$LOG" | head -n 5; rc=1
+  fi
 fi
 [ "$rc" -eq 0 ] && echo "[e2e] PASS" || echo "[e2e] FAIL (see $OUT and $LOG)"
 exit "$rc"

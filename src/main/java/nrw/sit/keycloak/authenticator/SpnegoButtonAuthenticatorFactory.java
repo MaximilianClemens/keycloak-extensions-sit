@@ -107,7 +107,7 @@ public class SpnegoButtonAuthenticatorFactory implements AuthenticatorFactory {
         // Nothing to close.
     }
 
-    private static boolean isKerberosFeatureEnabled() {
+    protected static boolean isKerberosFeatureEnabled() {
         return Profile.isFeatureEnabled(Profile.Feature.KERBEROS);
     }
 }

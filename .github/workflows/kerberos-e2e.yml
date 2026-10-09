@@ -33,7 +33,7 @@ jobs:
       - name: Install MIT Kerberos
         run: |
           sudo apt-get update -q
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q krb5-kdc krb5-admin-server krb5-user
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q krb5-kdc krb5-admin-server krb5-user krb5-pkinit
           curl --version | grep -qE "GSS-API|Kerberos|SPNEGO" || { echo "curl without SPNEGO support"; exit 1; }
 
       - name: Build provider jar
