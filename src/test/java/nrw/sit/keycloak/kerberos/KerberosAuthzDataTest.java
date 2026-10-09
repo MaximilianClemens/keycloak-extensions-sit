@@ -38,7 +38,14 @@ public class KerberosAuthzDataTest {
     }
 
     public static byte[] integer(int v) {
-        return tlv(0x02, new byte[]{(byte) v});
+        // minimal two's complement, e.g. 128 -> 00 80 (as in a real ad-type 128)
+        if (v >= 0 && v < 0x80) {
+            return tlv(0x02, new byte[]{(byte) v});
+        }
+        if (v >= 0x80 && v < 0x8000) {
+            return tlv(0x02, new byte[]{(byte) (v >> 8), (byte) v});
+        }
+        throw new IllegalArgumentException("test encoder supports 0..32767");
     }
 
     public static byte[] octets(byte[] v) {
