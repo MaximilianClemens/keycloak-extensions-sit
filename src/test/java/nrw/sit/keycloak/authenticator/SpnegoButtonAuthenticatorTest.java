@@ -337,7 +337,7 @@ class SpnegoButtonAuthenticatorTest {
         verify(context).attempted();
     }
 
-    // ── fix: never skip a mandatory step ─────────────────────────────────────
+    // ── fix: never skip a mandatory step, refuse a placement Keycloak ignores ─────────────────────────────────────
 
     @Test
     void refusesTheClickNextToAConditionalSibling() {
@@ -356,12 +356,33 @@ class SpnegoButtonAuthenticatorTest {
     }
 
     @Test
-    void refusesWhenTheButtonIsRequiredNextToARequiredStep() {
+    void aRequiredButtonLeavesTheOtherStepsOfItsSequenceAlone() {
         AuthenticationExecutionModel required = exec("krb-exec-id", "browser-flow-id", Requirement.REQUIRED, "sit-auth-spnego-button");
         AuthenticationExecutionModel password = exec("pw-exec-id", "browser-flow-id", Requirement.REQUIRED, "auth-username-password-form");
         when(realm.getAuthenticationExecutionsStream("browser-flow-id")).thenAnswer(inv -> Stream.of(password, required));
 
-        assertNull(SpnegoButtonAuthenticator.executionsToSkip(session, realm, required));
+        assertEquals(List.of(), SpnegoButtonAuthenticator.executionsToSkip(session, realm, required));
+    }
+
+    @Test
+    void stepUpFlowSkipsTheAlternativesButNotTheOtpSubFlow() {
+        // browser: cookie ALT | login ALT
+        //   login: first REQUIRED | otp CONDITIONAL
+        //     first: password ALT | button ALT
+        AuthenticationExecutionModel login = flowExec("login-exec-id", "browser-flow-id", Requirement.ALTERNATIVE, "login-flow-id");
+        AuthenticationExecutionModel first = flowExec("first-exec-id", "login-flow-id", Requirement.REQUIRED, "first-flow-id");
+        AuthenticationExecutionModel otp = flowExec("otp-exec-id", "login-flow-id", Requirement.CONDITIONAL, "otp-flow-id");
+        AuthenticationExecutionModel password = flowExec("pw-exec-id", "first-flow-id", Requirement.ALTERNATIVE, "pw-flow-id");
+        AuthenticationExecutionModel button = exec("krb-exec-id", "first-flow-id", Requirement.ALTERNATIVE, "sit-auth-spnego-button");
+        when(realm.getAuthenticationExecutionsStream("browser-flow-id")).thenAnswer(inv -> Stream.of(cookie, login));
+        when(realm.getAuthenticationExecutionsStream("login-flow-id")).thenAnswer(inv -> Stream.of(first, otp));
+        when(realm.getAuthenticationExecutionsStream("first-flow-id")).thenAnswer(inv -> Stream.of(password, button));
+        when(realm.getAuthenticationFlowById("login-flow-id")).thenReturn(flow("login-flow-id", false));
+        when(realm.getAuthenticationFlowById("first-flow-id")).thenReturn(flow("first-flow-id", false));
+        when(realm.getAuthenticationExecutionByFlowId("login-flow-id")).thenReturn(login);
+        when(realm.getAuthenticationExecutionByFlowId("first-flow-id")).thenReturn(first);
+
+        assertEquals(List.of("pw-exec-id", "cookie-exec-id"), SpnegoButtonAuthenticator.executionsToSkip(session, realm, button));
     }
 
     @Test
@@ -381,11 +402,11 @@ class SpnegoButtonAuthenticatorTest {
     }
 
     @Test
-    void nestedConditionalPlacementRefusesWhenTheSubFlowHasAnotherStep() {
+    void nestedConditionalPlacementLeavesAnOtpAfterTheButtonAlone() {
         AuthenticationExecutionModel otp = exec("otp-exec-id", "intern-flow-id", Requirement.REQUIRED, "auth-otp-form");
         AuthenticationExecutionModel button = nestedButton(otp);
 
-        assertNull(SpnegoButtonAuthenticator.executionsToSkip(session, realm, button));
+        assertEquals(List.of("cookie-exec-id", "forms-exec-id"), SpnegoButtonAuthenticator.executionsToSkip(session, realm, button));
     }
 
     @Test

@@ -14,8 +14,8 @@ public client) and then plays the login the way a browser does, with curl:
   F. conditional placement: ALTERNATIVE sub-flow > CONDITIONAL sub-flow > condition +
      button REQUIRED. Condition true: offered, login with ticket, fallback without ticket.
      Condition false: not offered, a forged selection is not accepted.
-  G. safety: a REQUIRED step next to the button (e.g. OTP after it) must not be skipped:
-     the click is refused, no Negotiate, no login with a ticket.
+  G. safety: a REQUIRED step after the button (OTP) is never skipped: Kerberos with a
+     ticket succeeds, then the OTP step follows instead of an authorization code.
   C. the built-in auth-spnego selected the same way -> "page expired"
      (documents the Keycloak behaviour this provider works around; if this check ever
      fails, Keycloak fixed it upstream and the provider may be retired)
@@ -482,22 +482,27 @@ def scenario_f_off(t, exec_id, config_id):
 
 
 def scenario_g(exec_id):
-    """Button REQUIRED with another REQUIRED step (OTP) after it in the same sub-flow: skipping
-    would bypass the OTP. The click must be refused."""
+    """Button REQUIRED with another REQUIRED step (OTP) after it in the same sub-flow. Skipping
+    the OTP would be a bypass; it must run after Kerberos."""
     kinit()
     b = Browser()
 
-    def refused():
+    def otp_follows():
         action = open_login_and_select(b, exec_id)
         status, headers, body, _ = b.request("POST", action, data={"authenticationExecution": exec_id})
-        if status == 303:
-            status, headers, body, _ = b.request("GET", headers["location"], negotiate=True)
-        if status == 401 or headers.get("www-authenticate"):
-            raise RuntimeError("Negotiate sent although a mandatory step would be skipped")
-        if status == 302 and "code=" in headers.get("location", ""):
+        if status != 303:
+            raise RuntimeError("HTTP %d instead of 303" % status)
+        status, headers, body, _ = b.request("GET", headers["location"], negotiate=True)
+        loc = headers.get("location", "")
+        if status == 302 and loc.startswith(REDIRECT_URI):
             raise RuntimeError("logged in without the OTP step")
-        return "click refused (HTTP %d), no Negotiate, no login" % status
-    check("G1 a REQUIRED step next to the button is never skipped", refused)
+        if status == 302 and "/login-actions/" in loc:
+            # no OTP configured yet: Keycloak redirects to the OTP set-up
+            status, headers, body, _ = b.request("GET", loc)
+        if status != 200 or not re.search(r'otp|totp', body, re.I):
+            raise RuntimeError("HTTP %d, OTP step expected (body: %s)" % (status, re.sub(r"\s+", " ", body)[:200]))
+        return "ticket accepted, OTP step follows (no authorization code)"
+    check("G1 a REQUIRED step after the button is never skipped", otp_follows)
 
 
 def scenario_c(exec_id):

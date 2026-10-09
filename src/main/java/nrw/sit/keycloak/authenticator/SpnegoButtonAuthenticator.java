@@ -82,10 +82,11 @@ import java.util.List;
  *
  * <h2>Safety rules</h2>
  * <ul>
- *   <li>Only the {@code ALTERNATIVE} executions along the path to the top-level flow are
- *       skipped. If that path has a {@code REQUIRED} or {@code CONDITIONAL} sibling (anything
- *       except condition authenticators), the click is refused and nothing is skipped, so a
- *       misconfigured flow can never bypass a mandatory step.</li>
+ *   <li>Only {@code ALTERNATIVE} executions are skipped (the alternatives of each
+ *       {@code ALTERNATIVE} on the path to the top-level flow). {@code REQUIRED} and
+ *       {@code CONDITIONAL} steps are never skipped and run as usual, e.g. an OTP sub-flow after
+ *       the first factor or an OTP form after the button. An {@code ALTERNATIVE} on the path next
+ *       to a mandatory step (a placement Keycloak ignores) refuses the click.</li>
  *   <li>A click only counts if the selection names this very execution.</li>
  *   <li>An {@code Authorization} header is only evaluated after the user clicked the button;
  *       otherwise it is ignored.</li>
@@ -130,8 +131,8 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
             // session: if the flow has a mandatory sibling on the way up, refuse.
             List<String> skip = executionsToSkip(context.getSession(), context.getRealm(), context.getExecution());
             if (skip == null) {
-                logger.warnf("Kerberos button in flow path '%s' refused: a REQUIRED or CONDITIONAL sibling would be "
-                        + "skipped. Place it as described in the help text.", context.getFlowPath());
+                logger.warnf("Kerberos button in flow path '%s' refused: an ALTERNATIVE on its path sits next to a "
+                        + "REQUIRED or CONDITIONAL step. Place it as described in the help text.", context.getFlowPath());
                 context.attempted();
                 return;
             }
@@ -170,27 +171,33 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
 
     /**
      * The executions that must be marked {@code ATTEMPTED} so that the next pass of the flow
-     * engine reaches {@code self}: the {@code ALTERNATIVE} siblings of {@code self} and of every
-     * sub-flow on the way up to the top-level flow. Condition authenticators and disabled
-     * executions are ignored.
+     * engine reaches {@code self}: the {@code ALTERNATIVE} siblings of every {@code ALTERNATIVE}
+     * execution on the way up to the top-level flow ({@code self} included). {@code REQUIRED} and
+     * {@code CONDITIONAL} executions are never skipped; they run as usual. Condition
+     * authenticators and disabled executions are ignored.
      *
-     * @return the execution ids, or {@code null} if a {@code REQUIRED} or {@code CONDITIONAL}
-     *         execution would have to be skipped (then nothing may be skipped at all)
+     * @return the execution ids, or {@code null} if an {@code ALTERNATIVE} on the path sits next to
+     *         a {@code REQUIRED} or {@code CONDITIONAL} step (a placement Keycloak ignores)
      */
     static List<String> executionsToSkip(KeycloakSession session, RealmModel realm, AuthenticationExecutionModel self) {
         List<String> skip = new ArrayList<>();
         AuthenticationExecutionModel current = self;
         while (true) {
             String parentFlowId = current.getParentFlow();
-            for (AuthenticationExecutionModel sibling : realm.getAuthenticationExecutionsStream(parentFlowId).toList()) {
-                if (sibling.getId().equals(current.getId()) || sibling.isDisabled() || isCondition(session, sibling)) {
-                    continue;
+            // In a sequence (current REQUIRED/CONDITIONAL) nothing is skipped: the other steps
+            // run as usual, e.g. an OTP sub-flow after the first factor.
+            if (current.isAlternative()) {
+                for (AuthenticationExecutionModel sibling : realm.getAuthenticationExecutionsStream(parentFlowId).toList()) {
+                    if (sibling.getId().equals(current.getId()) || sibling.isDisabled() || isCondition(session, sibling)) {
+                        continue;
+                    }
+                    if (!sibling.isAlternative()) {
+                        // an alternative next to a mandatory step: Keycloak ignores the alternatives
+                        // of such a flow, so this placement is wrong; never skip a mandatory step
+                        return null;
+                    }
+                    skip.add(sibling.getId());
                 }
-                if (!current.isAlternative() || !sibling.isAlternative()) {
-                    // current is part of a sequence, or sits next to a mandatory step
-                    return null;
-                }
-                skip.add(sibling.getId());
             }
             AuthenticationFlowModel parentFlow = realm.getAuthenticationFlowById(parentFlowId);
             if (parentFlow == null) {

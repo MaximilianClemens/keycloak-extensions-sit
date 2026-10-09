@@ -206,10 +206,11 @@ conditional placement below) and `DISABLED`.
 Safety rules:
 
 - A click only counts if the selection names this very execution.
-- Only `ALTERNATIVE` executions are skipped. If a `REQUIRED` or `CONDITIONAL` sibling (anything
-  except condition authenticators) sits on the way to the top-level flow, the click is refused
-  with a warning in the log and nothing is skipped. (Keycloak itself would then fail the
-  login instead of skipping the step; the refusal turns that into a clean fallback.)
+- Only `ALTERNATIVE` executions are skipped (the alternatives of each `ALTERNATIVE` on the way
+  to the top-level flow). `REQUIRED` and `CONDITIONAL` steps are never skipped and run as
+  usual, e.g. a conditional OTP sub-flow after the first factor, or an OTP form after the
+  button. An `ALTERNATIVE` on the way that sits next to a mandatory step (a placement Keycloak
+  ignores anyway) refuses the click with a warning in the log.
 - An `Authorization` header is only evaluated after the user clicked the button.
 
 ### Flow
@@ -246,9 +247,9 @@ Browser flow
 Both sub-flows are needed: Keycloak evaluates conditions only in a `CONDITIONAL` sub-flow, and
 a `CONDITIONAL` sub-flow directly in the top-level flow would make Keycloak ignore all
 top-level alternatives (cookie, forms, …). If the condition is false, the button is not
-offered and a forged selection is rejected by Keycloak. Nothing else may sit next to the
-button in the conditional sub-flow (the click would be refused). The e2e test covers this
-placement with a client-scope condition as stand-in.
+offered and a forged selection is rejected by Keycloak. Further `REQUIRED` steps after the
+button in the conditional sub-flow (e.g. OTP) run after Kerberos as usual. The e2e test covers
+this placement with a client-scope condition as stand-in.
 
 ### Theme
 
