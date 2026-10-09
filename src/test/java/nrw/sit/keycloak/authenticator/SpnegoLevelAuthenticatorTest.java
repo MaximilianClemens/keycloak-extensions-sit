@@ -1,7 +1,6 @@
 package nrw.sit.keycloak.authenticator;
 
 import jakarta.ws.rs.core.HttpHeaders;
-import jakarta.ws.rs.core.MultivaluedHashMap;
 import nrw.sit.keycloak.kerberos.AuthzCapturingSpnegoAuthenticator;
 import nrw.sit.keycloak.kerberos.KerberosAuthzData;
 import nrw.sit.keycloak.kerberos.KerberosAuthzDataTest;
@@ -11,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.authentication.AuthenticationFlowError;
 import org.keycloak.common.constants.KerberosConstants;
+import org.keycloak.common.util.MultivaluedHashMap;
 import org.keycloak.component.ComponentModel;
 import org.keycloak.events.EventBuilder;
 import org.keycloak.federation.kerberos.CommonKerberosConfig;
@@ -60,7 +60,7 @@ class SpnegoLevelAuthenticatorTest {
     private final UserProvider users = mock(UserProvider.class);
     private final HttpRequest request = mock(HttpRequest.class);
     private final HttpHeaders headers = mock(HttpHeaders.class);
-    private final MultivaluedHashMap<String, String> requestHeaders = new MultivaluedHashMap<>();
+    private final jakarta.ws.rs.core.MultivaluedHashMap<String, String> requestHeaders = new jakarta.ws.rs.core.MultivaluedHashMap<>();
     private final UserModel alice = mock(UserModel.class);
     private final ComponentModel kerberosComponent = mock(ComponentModel.class);
     private final AuthenticatorConfigModel authConfig = mock(AuthenticatorConfigModel.class);
@@ -92,7 +92,7 @@ class SpnegoLevelAuthenticatorTest {
         when(session.users()).thenReturn(users);
         when(request.getHttpMethod()).thenReturn("GET");
         when(request.getHttpHeaders()).thenReturn(headers);
-        when(request.getDecodedFormParameters()).thenReturn(new MultivaluedHashMap<>());
+        when(request.getDecodedFormParameters()).thenReturn(new jakarta.ws.rs.core.MultivaluedHashMap<>());
         when(headers.getRequestHeaders()).thenReturn(requestHeaders);
         requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "Negotiate YIIabc");
 
@@ -101,7 +101,7 @@ class SpnegoLevelAuthenticatorTest {
         when(kerberosComponent.getProviderId()).thenReturn("kerberos");
         when(kerberosComponent.getProviderType()).thenReturn(UserStorageProvider.class.getName());
         when(kerberosComponent.getName()).thenReturn("kerberos");
-        when(kerberosComponent.getConfig()).thenReturn(new MultivaluedHashMap<>(Map.of(
+        when(kerberosComponent.getConfig()).thenReturn(config(Map.of(
                 "enabled", "true", "priority", "0",
                 "kerberosRealm", "EXAMPLE.TEST", "serverPrincipal", "HTTP/kc.example.test@EXAMPLE.TEST",
                 "keyTab", "/nonexistent/keycloak.keytab")));
@@ -109,6 +109,12 @@ class SpnegoLevelAuthenticatorTest {
                 .thenAnswer(inv -> Stream.of(kerberosComponent));
 
         when(spnego.getAuthenticatedKerberosPrincipal()).thenReturn(null);
+    }
+
+    private static MultivaluedHashMap<String, String> config(Map<String, String> values) {
+        MultivaluedHashMap<String, String> out = new MultivaluedHashMap<>();
+        values.forEach(out::putSingle);
+        return out;
     }
 
     private void spnegoSucceeds(List<KerberosAuthzData.Entry> authz) {
@@ -222,14 +228,14 @@ class SpnegoLevelAuthenticatorTest {
         when(ldap.getProviderId()).thenReturn("ldap");
         when(ldap.getProviderType()).thenReturn(UserStorageProvider.class.getName());
         when(ldap.getName()).thenReturn("ad");
-        when(ldap.getConfig()).thenReturn(new MultivaluedHashMap<>(Map.of(
+        when(ldap.getConfig()).thenReturn(config(Map.of(
                 "enabled", "true", "priority", "0", "allowKerberosAuthentication", "true",
                 "kerberosRealm", "AD.TEST", "serverPrincipal", "HTTP/kc.ad.test@AD.TEST", "keyTab", "/x")));
         ComponentModel ldapWithout = mock(ComponentModel.class);
         when(ldapWithout.getProviderId()).thenReturn("ldap");
         when(ldapWithout.getProviderType()).thenReturn(UserStorageProvider.class.getName());
         when(ldapWithout.getName()).thenReturn("plain");
-        when(ldapWithout.getConfig()).thenReturn(new MultivaluedHashMap<>(Map.of("enabled", "true", "priority", "-1")));
+        when(ldapWithout.getConfig()).thenReturn(config(Map.of("enabled", "true", "priority", "-1")));
         when(realm.getComponentsStream(eq("realm-id"), eq(UserStorageProvider.class.getName())))
                 .thenAnswer(inv -> Stream.of(ldapWithout, ldap));
 
@@ -241,7 +247,7 @@ class SpnegoLevelAuthenticatorTest {
 
     @Test
     void disabledProvidersAreSkipped() {
-        when(kerberosComponent.getConfig()).thenReturn(new MultivaluedHashMap<>(Map.of("enabled", "false")));
+        when(kerberosComponent.getConfig()).thenReturn(config(Map.of("enabled", "false")));
 
         assertNull(SpnegoLevelAuthenticator.findKerberosConfig(realm));
     }

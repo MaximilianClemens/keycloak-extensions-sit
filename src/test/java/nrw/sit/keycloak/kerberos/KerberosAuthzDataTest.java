@@ -11,11 +11,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class KerberosAuthzDataTest {
+public class KerberosAuthzDataTest {
 
     // ── tiny DER encoder for building test input ─────────────────────────────
 
-    static byte[] tlv(int tag, byte[]... parts) {
+    public static byte[] tlv(int tag, byte[]... parts) {
         ByteArrayOutputStream body = new ByteArrayOutputStream();
         for (byte[] p : parts) {
             body.writeBytes(p);
@@ -37,36 +37,36 @@ class KerberosAuthzDataTest {
         return out.toByteArray();
     }
 
-    static byte[] integer(int v) {
+    public static byte[] integer(int v) {
         return tlv(0x02, new byte[]{(byte) v});
     }
 
-    static byte[] octets(byte[] v) {
+    public static byte[] octets(byte[] v) {
         return tlv(0x04, v);
     }
 
-    static byte[] utf8(String s) {
+    public static byte[] utf8(String s) {
         return tlv(0x0C, s.getBytes(StandardCharsets.UTF_8));
     }
 
-    static byte[] ctx(int n, byte[] inner) {
+    public static byte[] ctx(int n, byte[] inner) {
         return tlv(0xA0 | n, inner);
     }
 
-    static byte[] seq(byte[]... parts) {
+    public static byte[] seq(byte[]... parts) {
         return tlv(0x30, parts);
     }
 
     /** AuthorizationData ::= SEQUENCE OF SEQUENCE { ad-type [0] Int32, ad-data [1] OCTET STRING } */
-    static byte[] authorizationData(byte[]... elements) {
+    public static byte[] authorizationData(byte[]... elements) {
         return seq(elements);
     }
 
-    static byte[] element(int type, byte[] data) {
+    public static byte[] element(int type, byte[] data) {
         return seq(ctx(0, integer(type)), ctx(1, octets(data)));
     }
 
-    static byte[] indicators(String... names) {
+    public static byte[] indicators(String... names) {
         byte[][] parts = new byte[names.length][];
         for (int i = 0; i < names.length; i++) {
             parts[i] = utf8(names[i]);
