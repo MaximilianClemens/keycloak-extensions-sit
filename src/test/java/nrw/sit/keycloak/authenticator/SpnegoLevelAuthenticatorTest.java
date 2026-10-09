@@ -98,6 +98,8 @@ class SpnegoLevelAuthenticatorTest {
         when(request.getDecodedFormParameters()).thenReturn(new jakarta.ws.rs.core.MultivaluedHashMap<>());
         when(headers.getRequestHeaders()).thenReturn(requestHeaders);
         requestHeaders.putSingle(HttpHeaders.AUTHORIZATION, "Negotiate YIIabc");
+        // the ticket answers a button click (a header without one is ignored)
+        when(authSession.getAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE)).thenReturn("true");
 
         // one enabled Kerberos user storage provider in the realm
         when(realm.getId()).thenReturn("realm-id");
