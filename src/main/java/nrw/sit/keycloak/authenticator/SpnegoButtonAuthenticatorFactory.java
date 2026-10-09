@@ -16,9 +16,8 @@ import java.util.List;
 /**
  * Factory for {@link SpnegoButtonAuthenticator}. Mirrors the built-in
  * {@code SpnegoAuthenticatorFactory} (same reference category, same Kerberos feature guard).
- * {@code ALTERNATIVE} is the normal placement. {@code REQUIRED} exists only for the conditional
- * placement (as the single step of a {@code CONDITIONAL} sub-flow inside an {@code ALTERNATIVE}
- * sub-flow); next to other mandatory steps the authenticator refuses the click.
+ * Only {@code ALTERNATIVE} (and {@code DISABLED}): the button is always one choice among
+ * others, also behind a condition (see {@link SpnegoButtonAuthenticator}).
  */
 public class SpnegoButtonAuthenticatorFactory implements AuthenticatorFactory {
 
@@ -26,7 +25,6 @@ public class SpnegoButtonAuthenticatorFactory implements AuthenticatorFactory {
 
     private static final Requirement[] REQUIREMENT_CHOICES = {
             Requirement.ALTERNATIVE,
-            Requirement.REQUIRED,
             Requirement.DISABLED,
     };
 
@@ -84,7 +82,7 @@ public class SpnegoButtonAuthenticatorFactory implements AuthenticatorFactory {
                 ? "SPNEGO/Kerberos that is started by the user from the login page (authentication selection, "
                 + "e.g. a 'Sign in with Windows' button) instead of automatically. Place as ALTERNATIVE "
                 + "after the forms sub-flow. To show it only under a condition: ALTERNATIVE sub-flow after "
-                + "the forms > CONDITIONAL sub-flow > condition(s) + this execution as REQUIRED."
+                + "the forms > CONDITIONAL sub-flow > condition(s) + this execution as ALTERNATIVE."
                 : "DISABLED. Please enable Kerberos feature and make sure Kerberos available in your platform. "
                 + "SPNEGO/Kerberos started on demand from the login page.";
     }

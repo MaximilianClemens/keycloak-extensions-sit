@@ -60,8 +60,8 @@ class SpnegoButtonAuthenticatorFactoryTest {
             assertSame(SpnegoButtonAuthenticator.SINGLETON, factory.create(mock(KeycloakSession.class)));
             assertTrue(choices.contains(Requirement.ALTERNATIVE));
             assertTrue(choices.contains(Requirement.DISABLED));
-            // REQUIRED only for the conditional placement (single step of a CONDITIONAL sub-flow)
-            assertTrue(choices.contains(Requirement.REQUIRED));
+            // always one choice among others, also behind a condition
+            assertFalse(choices.contains(Requirement.REQUIRED));
             assertFalse(choices.contains(Requirement.CONDITIONAL));
         } else {
             assertSame(SpnegoButtonAuthenticatorFactory.SINGLETON_DISABLED, factory.create(mock(KeycloakSession.class)));

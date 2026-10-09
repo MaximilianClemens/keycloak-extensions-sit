@@ -11,11 +11,12 @@ public client) and then plays the login the way a browser does, with curl:
      -> code exchanged, token says preferred_username=alice
   B. no ticket -> same selection -> 401 with Keycloak's fallback form -> fallback POST
      -> password form (no "page expired")
-  F. conditional placement: ALTERNATIVE sub-flow > CONDITIONAL sub-flow > condition +
-     button REQUIRED. Condition true: offered, login with ticket, fallback without ticket.
+  F. conditional placement ("double wrapper"): ALTERNATIVE sub-flow > CONDITIONAL sub-flow >
+     condition + button ALTERNATIVE. Condition true: offered, login with ticket, fallback without ticket.
      Condition false: not offered, a forged selection is not accepted.
-  G. safety: a REQUIRED step after the button (OTP) is never skipped: Kerberos with a
-     ticket succeeds, then the OTP step follows instead of an authorization code.
+  G. step-up layout: bronze REQUIRED (password sub-flow | button, both ALTERNATIVE), then
+     silver CONDITIONAL (condition + OTP). The click skips only the password; after Kerberos
+     the silver OTP step follows instead of an authorization code.
   C. the built-in auth-spnego selected the same way -> "page expired"
      (documents the Keycloak behaviour this provider works around; if this check ever
      fails, Keycloak fixed it upstream and the provider may be retired)
@@ -45,7 +46,7 @@ REDIRECT_URI = BASE + "/e2e/callback"
 FLOW_BUTTON = "e2e-browser-button"
 FLOW_BUILTIN = "e2e-browser-builtin"
 FLOW_NESTED = "e2e-browser-nested"
-FLOW_GUARDED = "e2e-browser-guarded"
+FLOW_STEPUP = "e2e-browser-stepup"
 PROVIDER_BUTTON = "sit-auth-spnego-button"
 PROVIDER_BUILTIN = "auth-spnego"
 
@@ -197,7 +198,7 @@ def setup_realm(t):
     execs[FLOW_BUTTON] = build_flow(t, FLOW_BUTTON, PROVIDER_BUTTON, before_forms=False)
     execs[FLOW_BUILTIN] = build_flow(t, FLOW_BUILTIN, PROVIDER_BUILTIN, before_forms=False)
     execs[FLOW_NESTED] = build_nested_flow(t, FLOW_NESTED)
-    execs[FLOW_GUARDED] = build_nested_flow(t, FLOW_GUARDED, step_after_button="auth-otp-form")
+    execs[FLOW_STEPUP] = build_stepup_flow(t, FLOW_STEPUP)
     return execs
 
 
@@ -247,10 +248,10 @@ def build_flow(t, name, provider, before_forms):
     return target["id"]
 
 
-def build_nested_flow(t, name, step_after_button=None):
-    """Copy of the browser flow with the button behind a condition:
+def build_nested_flow(t, name):
+    """Copy of the browser flow with the button behind a condition ("double wrapper"):
          forms ALT | <name>-kerberos ALT > <name>-intern CONDITIONAL > client-scope condition
-         REQUIRED + button REQUIRED [+ step_after_button REQUIRED] | passkey ALT
+         REQUIRED + button ALTERNATIVE | passkey ALT
     The condition is "client requests scope 'profile'" (a default scope, so true); it stands in
     for a network condition. Returns (button execution id, condition config id)."""
     r = "/admin/realms/" + REALM
@@ -275,22 +276,19 @@ def build_nested_flow(t, name, step_after_button=None):
                                  "description": "Kerberos (wrapper)"}, token=t)
     api("POST", r + "/authentication/flows/%s/executions/flow" % q(wrap),
         {"alias": intern, "type": "basic-flow", "provider": "registration-page-form", "description": "Kerberos intern"}, token=t)
-    for provider in ["conditional-client-scope", PROVIDER_BUTTON] + ([step_after_button] if step_after_button else []):
+    for provider in ["conditional-client-scope", PROVIDER_BUTTON]:
         api("POST", r + "/authentication/flows/%s/executions/execution" % q(intern), {"provider": provider}, token=t)
     api("POST", path + "/execution", {"provider": "webauthn-authenticator-passwordless"}, token=t)
 
     execs = all_execs()
     by_name = lambda n: next(e for e in execs if e.get("displayName") == n and e.get("authenticationFlow"))
     start = next(i for i, e in enumerate(execs) if e.get("displayName") == intern and e.get("authenticationFlow"))
-    # providers inside the intern sub-flow (the copied browser flow has its own OTP form elsewhere)
     by_provider = lambda pid: next(e for e in execs[start + 1:] if e.get("providerId") == pid)
     update(by_name(wrap), requirement="ALTERNATIVE")
     update(by_name(intern), requirement="CONDITIONAL")
     update(by_provider("conditional-client-scope"), requirement="REQUIRED")
-    update(by_provider(PROVIDER_BUTTON), requirement="REQUIRED")
-    if step_after_button:
-        update(by_provider(step_after_button), requirement="REQUIRED")
-    update(by_provider("webauthn-authenticator-passwordless"), requirement="ALTERNATIVE")
+    update(by_provider(PROVIDER_BUTTON), requirement="ALTERNATIVE")
+    update(next(e for e in execs if e.get("providerId") == "webauthn-authenticator-passwordless"), requirement="ALTERNATIVE")
 
     cond = by_provider("conditional-client-scope")
     _, location = api("POST", r + "/authentication/executions/%s/config" % cond["id"],
@@ -306,6 +304,63 @@ def build_nested_flow(t, name, step_after_button=None):
     if os.environ.get("E2E_DEBUG"):
         print("  %s: %s" % (name, order))
     return by_provider(PROVIDER_BUTTON)["id"], config_id
+
+
+def build_stepup_flow(t, name):
+    """The SIT layout, built from scratch:
+         <name>                         top level
+         |- Cookie                      ALTERNATIVE
+         `- bronze/silver (sub-flow)    ALTERNATIVE
+            |- bronze (sub-flow)        REQUIRED
+            |  |- password (sub-flow)   ALTERNATIVE > Username Password Form REQUIRED
+            |  `- button                ALTERNATIVE
+            `- silver (sub-flow)        CONDITIONAL
+               |- client-scope condition (true, stands in for "requested ACR")
+               `- OTP Form              REQUIRED
+    Returns the button execution id."""
+    r = "/admin/realms/" + REALM
+    q = urllib.parse.quote
+    api("POST", r + "/authentication/flows",
+        {"alias": name, "providerId": "basic-flow", "topLevel": True, "builtIn": False, "description": ""}, token=t)
+
+    def executions(flow_alias):
+        execs, _ = api("GET", r + "/authentication/flows/%s/executions" % q(flow_alias), token=t)
+        return execs
+
+    def set_requirement(flow_alias, execution, requirement):
+        rep = dict(execution)
+        rep["requirement"] = requirement
+        api("PUT", r + "/authentication/flows/%s/executions" % q(flow_alias), rep, token=t)
+
+    def add_execution(flow_alias, provider, requirement, config=None):
+        api("POST", r + "/authentication/flows/%s/executions/execution" % q(flow_alias), {"provider": provider}, token=t)
+        ex = [e for e in executions(flow_alias) if e.get("level", 0) == 0 and e.get("providerId") == provider][-1]
+        set_requirement(flow_alias, ex, requirement)
+        if config:
+            api("POST", r + "/authentication/executions/%s/config" % ex["id"],
+                {"alias": "%s-%s" % (flow_alias, provider), "config": config}, token=t)
+        return ex
+
+    def add_subflow(parent_alias, alias, requirement):
+        api("POST", r + "/authentication/flows/%s/executions/flow" % q(parent_alias),
+            {"alias": alias, "type": "basic-flow", "provider": "registration-page-form", "description": ""}, token=t)
+        ex = [e for e in executions(parent_alias) if e.get("level", 0) == 0 and e.get("displayName") == alias][-1]
+        set_requirement(parent_alias, ex, requirement)
+        return alias
+
+    add_execution(name, "auth-cookie", "ALTERNATIVE")
+    login = add_subflow(name, name + " bronze-silver", "ALTERNATIVE")
+    bronze = add_subflow(login, name + " bronze", "REQUIRED")
+    password = add_subflow(bronze, name + " password", "ALTERNATIVE")
+    add_execution(password, "auth-username-password-form", "REQUIRED")
+    button = add_execution(bronze, PROVIDER_BUTTON, "ALTERNATIVE")
+    silver = add_subflow(login, name + " silver", "CONDITIONAL")
+    add_execution(silver, "conditional-client-scope", "REQUIRED", {"client_scope": "profile", "negate": "false"})
+    add_execution(silver, "auth-otp-form", "REQUIRED")
+    if os.environ.get("E2E_DEBUG"):
+        print("  %s: %s" % (name, [(e.get("level"), e.get("providerId") or e.get("displayName"), e["requirement"])
+                                   for e in executions(name)]))
+    return button["id"]
 
 
 def set_condition(t, config_id, name, holds):
@@ -482,8 +537,8 @@ def scenario_f_off(t, exec_id, config_id):
 
 
 def scenario_g(exec_id):
-    """Button REQUIRED with another REQUIRED step (OTP) after it in the same sub-flow. Skipping
-    the OTP would be a bypass; it must run after Kerberos."""
+    """Step-up layout: the click skips the password alternative only; the silver sub-flow
+    (OTP) is a later step of the sequence and must run after Kerberos."""
     kinit()
     b = Browser()
 
@@ -502,7 +557,7 @@ def scenario_g(exec_id):
         if status != 200 or not re.search(r'otp|totp', body, re.I):
             raise RuntimeError("HTTP %d, OTP step expected (body: %s)" % (status, re.sub(r"\s+", " ", body)[:200]))
         return "ticket accepted, OTP step follows (no authorization code)"
-    check("G1 a REQUIRED step after the button is never skipped", otp_follows)
+    check("G1 step-up: after Kerberos the silver OTP step follows", otp_follows)
 
 
 def scenario_c(exec_id):
@@ -539,8 +594,8 @@ def main():
     scenario_b(nested_id, p="FB")
     scenario_f_off(t, nested_id, nested_cfg)
 
-    bind_flow(t, FLOW_GUARDED)
-    scenario_g(execs[FLOW_GUARDED][0])
+    bind_flow(t, FLOW_STEPUP)
+    scenario_g(execs[FLOW_STEPUP])
 
     bind_flow(t, FLOW_BUILTIN)
     scenario_c(execs[FLOW_BUILTIN])

@@ -193,24 +193,24 @@ request whose retry is harmless, a `GET` of the flow's refresh URL (no `session_
 |---|---|
 | first pass of the flow | the execution sits after the forms, so it is never reached; being unprocessed, it is listed in `authenticationSelections` (Keycloak drops executions that already reported *attempted*) |
 | `POST` with `authenticationExecution=<this>` (button) | `AuthenticationProcessor.resetFlow()`, the `ALTERNATIVE` siblings on the way up to the top-level flow marked `ATTEMPTED` (so the next pass skips the forms), auth note `sit.spnego-button.requested=true`, `303` to `getRefreshUrl()` |
-| `GET` refresh URL, note set | `401 Negotiate` with Keycloak's auto-submitting fallback form in the body (also when the execution is `REQUIRED` inside a conditional sub-flow) |
+| `GET` refresh URL, note set | `401 Negotiate` with Keycloak's auto-submitting fallback form in the body |
 | browser retry of that `GET` with `Authorization: Negotiate …` | built-in validation through the Kerberos user federation provider; a rejected ticket resets the flow back to the password form |
 | any request with an `Authorization` header but without a prior click | header ignored, Kerberos stays on demand |
 | no ticket: fallback form posts to this execution | `action()` resets the flow; the password form renders and the option is offered again |
 
 Ticket validation, keytab handling and user lookup are untouched; the Kerberos settings live
 in the LDAP/Kerberos user federation provider as before. The factory reports the `kerberos`
-reference category like the built-in one and offers `ALTERNATIVE`, `REQUIRED` (only for the
-conditional placement below) and `DISABLED`.
+reference category like the built-in one and offers `ALTERNATIVE` and `DISABLED` only: the
+button is always one choice among others.
 
 Safety rules:
 
 - A click only counts if the selection names this very execution.
 - Only `ALTERNATIVE` executions are skipped (the alternatives of each `ALTERNATIVE` on the way
   to the top-level flow). `REQUIRED` and `CONDITIONAL` steps are never skipped and run as
-  usual, e.g. a conditional OTP sub-flow after the first factor, or an OTP form after the
-  button. An `ALTERNATIVE` on the way that sits next to a mandatory step (a placement Keycloak
-  ignores anyway) refuses the click with a warning in the log.
+  usual, e.g. a conditional OTP sub-flow after the first factor. An `ALTERNATIVE` on the way
+  that sits next to a mandatory step (a placement Keycloak ignores anyway) refuses the click
+  with a warning in the log.
 - An `Authorization` header is only evaluated after the user clicked the button.
 
 ### Flow
@@ -231,7 +231,27 @@ first pass, reports *attempted* and is no longer offered on the login page. Plac
 them, it is offered, and the button click takes care of being reached on the next pass by
 skipping its siblings. Leave the built-in *Kerberos* execution `DISABLED` (or remove it).
 
+### Step-up flow (bronze/silver)
+
+```
+Browser flow
+├─ Cookie                        ALTERNATIVE
+└─ Bronze/Silver                 ALTERNATIVE   (sub-flow)
+   ├─ Bronze                     REQUIRED      (sub-flow)
+   │  ├─ Username Password Form  ALTERNATIVE   (sit-auth-username-password-form, or a sub-flow)
+   │  └─ SIT: Kerberos (on demand) ALTERNATIVE ← after the form
+   └─ Silver                     CONDITIONAL   (sub-flow)
+      ├─ <condition: requested ACR>
+      └─ OTP Form                REQUIRED
+```
+
+The click skips the password form (and the cookie); silver is a later step and runs after
+Kerberos as after the password.
+
 ### Only under a condition (e.g. internal network)
+
+Keycloak has no "conditional alternative" requirement (proposed upstream in discussion
+keycloak/keycloak#17152), hence a double wrapper:
 
 ```
 Browser flow
@@ -241,15 +261,14 @@ Browser flow
 └─ Kerberos                      ALTERNATIVE   (sub-flow, after the forms)
    └─ Kerberos intern            CONDITIONAL   (sub-flow)
       ├─ <condition>             REQUIRED
-      └─ SIT: Kerberos (on demand) REQUIRED
+      └─ SIT: Kerberos (on demand) ALTERNATIVE
 ```
 
 Both sub-flows are needed: Keycloak evaluates conditions only in a `CONDITIONAL` sub-flow, and
 a `CONDITIONAL` sub-flow directly in the top-level flow would make Keycloak ignore all
 top-level alternatives (cookie, forms, …). If the condition is false, the button is not
-offered and a forged selection is rejected by Keycloak. Further `REQUIRED` steps after the
-button in the conditional sub-flow (e.g. OTP) run after Kerberos as usual. The e2e test covers
-this placement with a client-scope condition as stand-in.
+offered and a forged selection is rejected by Keycloak. The e2e test covers this placement
+with a client-scope condition as stand-in.
 
 ### Theme
 

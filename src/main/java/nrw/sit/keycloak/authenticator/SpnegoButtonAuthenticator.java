@@ -76,7 +76,7 @@ import java.util.List;
  *
  * <p>To offer the button only under a condition (e.g. internal network), wrap it twice: an
  * {@code ALTERNATIVE} sub-flow after the forms, containing a {@code CONDITIONAL} sub-flow with
- * the condition(s) and this execution as {@code REQUIRED}. A single {@code ALTERNATIVE} sub-flow
+ * the condition(s) and this execution as {@code ALTERNATIVE}. A single {@code ALTERNATIVE} sub-flow
  * is not enough (Keycloak ignores conditions there), and a {@code CONDITIONAL} sub-flow directly
  * in the top-level flow would make Keycloak ignore all top-level alternatives.
  *
@@ -148,8 +148,8 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
 
         if (requested) {
             // Phase 2: GET after the redirect: 401 Negotiate with Keycloak's auto-submitting
-            // fallback form. Always the fallback variant, also when the execution is REQUIRED inside
-            // a conditional sub-flow (the built-in code would send a dead-end error page then).
+            // fallback form. Always the fallback variant, even if the execution was set to REQUIRED
+            // through the admin API (the built-in code would send a dead-end error page then).
             logger.debug("Kerberos requested, sending SPNEGO challenge");
             context.forceChallenge(optionalChallengeRedirect(context, KerberosConstants.NEGOTIATE));
             return;

@@ -136,13 +136,13 @@ class SpnegoButtonAuthenticatorTest {
     /**
      * browser-flow: cookie ALT | forms ALT | kerberos-wrap ALT
      *   kerberos-wrap: intern CONDITIONAL
-     *     intern: condition REQUIRED | [extra] | button REQUIRED
+     *     intern: condition REQUIRED | [extra] | button ALTERNATIVE
      */
     private AuthenticationExecutionModel nestedButton(AuthenticationExecutionModel... extraInIntern) {
         AuthenticationExecutionModel wrap = flowExec("wrap-exec-id", "browser-flow-id", Requirement.ALTERNATIVE, "wrap-flow-id");
         AuthenticationExecutionModel intern = flowExec("intern-exec-id", "wrap-flow-id", Requirement.CONDITIONAL, "intern-flow-id");
         AuthenticationExecutionModel condition = exec("cond-exec-id", "intern-flow-id", Requirement.REQUIRED, "condition-x");
-        AuthenticationExecutionModel button = exec("krb-nested-id", "intern-flow-id", Requirement.REQUIRED, "sit-auth-spnego-button");
+        AuthenticationExecutionModel button = exec("krb-nested-id", "intern-flow-id", Requirement.ALTERNATIVE, "sit-auth-spnego-button");
 
         when(realm.getAuthenticationExecutionsStream("browser-flow-id")).thenAnswer(inv -> Stream.of(cookie, forms, wrap));
         when(realm.getAuthenticationExecutionsStream("wrap-flow-id")).thenAnswer(inv -> Stream.of(intern));
@@ -402,16 +402,26 @@ class SpnegoButtonAuthenticatorTest {
     }
 
     @Test
-    void nestedConditionalPlacementLeavesAnOtpAfterTheButtonAlone() {
+    void nestedConditionalPlacementRefusesAnAlternativeNextToARequiredStep() {
         AuthenticationExecutionModel otp = exec("otp-exec-id", "intern-flow-id", Requirement.REQUIRED, "auth-otp-form");
         AuthenticationExecutionModel button = nestedButton(otp);
 
-        assertEquals(List.of("cookie-exec-id", "forms-exec-id"), SpnegoButtonAuthenticator.executionsToSkip(session, realm, button));
+        assertNull(SpnegoButtonAuthenticator.executionsToSkip(session, realm, button));
     }
 
     @Test
-    void requiredInTheNestedPlacementStillGetsTheFallbackFormNotAnErrorPage() {
-        AuthenticationExecutionModel button = nestedButton();
+    void nestedConditionalPlacementIgnoresAnAlternativeNextToTheButton() {
+        AuthenticationExecutionModel other = exec("other-exec-id", "intern-flow-id", Requirement.ALTERNATIVE, "auth-x");
+        AuthenticationExecutionModel button = nestedButton(other);
+
+        assertEquals(List.of("other-exec-id", "cookie-exec-id", "forms-exec-id"),
+                SpnegoButtonAuthenticator.executionsToSkip(session, realm, button));
+    }
+
+    @Test
+    void aRequiredExecutionStillGetsTheFallbackFormNotAnErrorPage() {
+        // not offered in the UI, but settable through the admin API
+        AuthenticationExecutionModel button = exec("krb-req-id", "browser-flow-id", Requirement.REQUIRED, "sit-auth-spnego-button");
         when(context.getExecution()).thenReturn(button);
         when(authSession.getAuthNote(SpnegoButtonAuthenticator.REQUESTED_NOTE)).thenReturn("true");
 
