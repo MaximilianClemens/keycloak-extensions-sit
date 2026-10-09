@@ -62,7 +62,10 @@ class SpnegoLevelAuthenticatorTest {
     private final HttpHeaders headers = mock(HttpHeaders.class);
     private final jakarta.ws.rs.core.MultivaluedHashMap<String, String> requestHeaders = new jakarta.ws.rs.core.MultivaluedHashMap<>();
     private final UserModel alice = mock(UserModel.class);
-    private final ComponentModel kerberosComponent = mock(ComponentModel.class);
+    private final ComponentModel kerberosComponent = component("kerberos", "kerberos", Map.of(
+            "enabled", "true", "priority", "0",
+            "kerberosRealm", "EXAMPLE.TEST", "serverPrincipal", "HTTP/kc.example.test@EXAMPLE.TEST",
+            "keyTab", "/nonexistent/keycloak.keytab"));
     private final AuthenticatorConfigModel authConfig = mock(AuthenticatorConfigModel.class);
 
     private final AuthzCapturingSpnegoAuthenticator spnego = mock(AuthzCapturingSpnegoAuthenticator.class);
@@ -98,23 +101,23 @@ class SpnegoLevelAuthenticatorTest {
 
         // one enabled Kerberos user storage provider in the realm
         when(realm.getId()).thenReturn("realm-id");
-        when(kerberosComponent.getProviderId()).thenReturn("kerberos");
-        when(kerberosComponent.getProviderType()).thenReturn(UserStorageProvider.class.getName());
-        when(kerberosComponent.getName()).thenReturn("kerberos");
-        when(kerberosComponent.getConfig()).thenReturn(config(Map.of(
-                "enabled", "true", "priority", "0",
-                "kerberosRealm", "EXAMPLE.TEST", "serverPrincipal", "HTTP/kc.example.test@EXAMPLE.TEST",
-                "keyTab", "/nonexistent/keycloak.keytab")));
         when(realm.getComponentsStream(eq("realm-id"), eq(UserStorageProvider.class.getName())))
                 .thenAnswer(inv -> Stream.of(kerberosComponent));
 
         when(spnego.getAuthenticatedKerberosPrincipal()).thenReturn(null);
     }
 
-    private static MultivaluedHashMap<String, String> config(Map<String, String> values) {
-        MultivaluedHashMap<String, String> out = new MultivaluedHashMap<>();
-        values.forEach(out::putSingle);
-        return out;
+    /** A real ComponentModel: the UserStorageProviderModel copy constructor reads its fields, not getters. */
+    private static ComponentModel component(String providerId, String name, Map<String, String> values) {
+        ComponentModel model = new ComponentModel();
+        model.setId(name + "-id");
+        model.setName(name);
+        model.setProviderId(providerId);
+        model.setProviderType(UserStorageProvider.class.getName());
+        MultivaluedHashMap<String, String> config = new MultivaluedHashMap<>();
+        values.forEach(config::putSingle);
+        model.setConfig(config);
+        return model;
     }
 
     private void spnegoSucceeds(List<KerberosAuthzData.Entry> authz) {
@@ -224,18 +227,10 @@ class SpnegoLevelAuthenticatorTest {
 
     @Test
     void findsAnLdapProviderWithKerberosEnabled() {
-        ComponentModel ldap = mock(ComponentModel.class);
-        when(ldap.getProviderId()).thenReturn("ldap");
-        when(ldap.getProviderType()).thenReturn(UserStorageProvider.class.getName());
-        when(ldap.getName()).thenReturn("ad");
-        when(ldap.getConfig()).thenReturn(config(Map.of(
+        ComponentModel ldap = component("ldap", "ad", Map.of(
                 "enabled", "true", "priority", "0", "allowKerberosAuthentication", "true",
-                "kerberosRealm", "AD.TEST", "serverPrincipal", "HTTP/kc.ad.test@AD.TEST", "keyTab", "/x")));
-        ComponentModel ldapWithout = mock(ComponentModel.class);
-        when(ldapWithout.getProviderId()).thenReturn("ldap");
-        when(ldapWithout.getProviderType()).thenReturn(UserStorageProvider.class.getName());
-        when(ldapWithout.getName()).thenReturn("plain");
-        when(ldapWithout.getConfig()).thenReturn(config(Map.of("enabled", "true", "priority", "-1")));
+                "kerberosRealm", "AD.TEST", "serverPrincipal", "HTTP/kc.ad.test@AD.TEST", "keyTab", "/x"));
+        ComponentModel ldapWithout = component("ldap", "plain", Map.of("enabled", "true", "priority", "-1"));
         when(realm.getComponentsStream(eq("realm-id"), eq(UserStorageProvider.class.getName())))
                 .thenAnswer(inv -> Stream.of(ldapWithout, ldap));
 
@@ -247,7 +242,9 @@ class SpnegoLevelAuthenticatorTest {
 
     @Test
     void disabledProvidersAreSkipped() {
-        when(kerberosComponent.getConfig()).thenReturn(config(Map.of("enabled", "false")));
+        ComponentModel disabled = component("kerberos", "off", Map.of("enabled", "false"));
+        when(realm.getComponentsStream(eq("realm-id"), eq(UserStorageProvider.class.getName())))
+                .thenAnswer(inv -> Stream.of(disabled));
 
         assertNull(SpnegoLevelAuthenticator.findKerberosConfig(realm));
     }
