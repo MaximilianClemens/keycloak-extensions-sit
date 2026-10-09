@@ -33,9 +33,9 @@ jobs:
         if: failure()
         run: |
           # Compile errors, failed tests and Maven errors, readable without the raw log.
-          grep -E "ERROR\]|FAILURE|Tests run:.*(Failures: [1-9]|Errors: [1-9])|<<< (FAILURE|ERROR)|expected:|but was:" build.log \
+          grep -E "ERROR\]|FAILURE|Tests run:.*(Failures: [1-9]|Errors: [1-9])|<<< (FAILURE|ERROR)|expected:|but was:|^[a-z][A-Za-z0-9_.]*(Exception|Error)|^Wanted|^Actual|^Caused by|^\s+at nrw\.sit" build.log \
             | grep -vE "^\[ERROR\] *$|Re-run Maven|full stack trace|Help [0-9]|cwiki.apache.org|read the following" \
-            | head -n 40 \
+            | head -n 60 \
             | while IFS= read -r line; do echo "::error::${line}"; done
 
       - name: Summary

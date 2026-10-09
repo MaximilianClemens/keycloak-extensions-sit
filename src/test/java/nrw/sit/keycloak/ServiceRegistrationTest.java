@@ -29,7 +29,7 @@ class ServiceRegistrationTest {
 
     @Test
     void authenticatorFactories() throws Exception {
-        assertRegistered(AuthenticatorFactory.class, 5);
+        assertRegistered(AuthenticatorFactory.class, 7);
     }
 
     @Test

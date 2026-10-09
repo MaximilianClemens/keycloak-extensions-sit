@@ -20,6 +20,10 @@ public client) and then plays the login the way a browser does, with curl:
   C. the built-in auth-spnego selected the same way -> "page expired"
      (documents the Keycloak behaviour this provider works around; if this check ever
      fails, Keycloak fixed it upstream and the provider may be retired)
+  D. sit-auth-spnego-level inside a step-up flow (first factor sub-flow, conditional OTP
+     sub-flow guarded by sit-conditional-current-loa < 2): a ticket obtained with PKINIT
+     (indicator "pkinit") logs in at level 2 and skips OTP, acr claim "silver"; a password
+     ticket is level 1 and runs into the OTP step. Needs the PKINIT set-up of setup-kdc.sh.
 
 Usage: kerberos_e2e.py <base-url> <keytab>
 The base URL must use the host of the service principal (http://keycloak.example.test:8080).
@@ -47,8 +51,12 @@ FLOW_BUTTON = "e2e-browser-button"
 FLOW_BUILTIN = "e2e-browser-builtin"
 FLOW_NESTED = "e2e-browser-nested"
 FLOW_STEPUP = "e2e-browser-stepup"
+FLOW_LEVEL = "e2e-level"
 PROVIDER_BUTTON = "sit-auth-spnego-button"
 PROVIDER_BUILTIN = "auth-spnego"
+PROVIDER_LEVEL = "sit-auth-spnego-level"
+PROVIDER_CURRENT_LOA = "sit-conditional-current-loa"
+PKINIT_DIR = os.environ.get("PKINIT_DIR", os.path.join(os.path.dirname(os.path.abspath(KEYTAB)), "pkinit"))
 
 failures = []
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -162,6 +170,16 @@ def kinit():
     subprocess.run(["kinit", "alice"], input="alicepw\n", capture_output=True, text=True, check=True, timeout=30)
 
 
+def kinit_pkinit():
+    identity = "X509_user_identity=FILE:%s/alice.pem,%s/alicekey.pem" % (PKINIT_DIR, PKINIT_DIR)
+    subprocess.run(["kinit", "-X", identity, "alice"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                   check=True, timeout=30)
+
+
+def pkinit_available():
+    return os.path.exists(os.path.join(PKINIT_DIR, "alice.pem"))
+
+
 def kdestroy():
     subprocess.run(["kdestroy", "-A"], capture_output=True, text=True, timeout=30)
 
@@ -172,7 +190,9 @@ def setup_realm(t):
     r = "/admin/realms/" + REALM
     api("DELETE", r, token=t, expect=(204, 404))
     api("POST", "/admin/realms", {"realm": REALM, "enabled": True, "defaultLocale": "en",
-                                   "internationalizationEnabled": False}, token=t)
+                                   "internationalizationEnabled": False,
+                                   "attributes": {"acr.loa.map": json.dumps({"bronze": 1, "silver": 2, "gold": 3})}},
+        token=t)
 
     api("POST", r + "/components", {
         "name": "kerberos", "providerId": "kerberos",
@@ -199,7 +219,71 @@ def setup_realm(t):
     execs[FLOW_BUILTIN] = build_flow(t, FLOW_BUILTIN, PROVIDER_BUILTIN, before_forms=False)
     execs[FLOW_NESTED] = build_nested_flow(t, FLOW_NESTED)
     execs[FLOW_STEPUP] = build_stepup_flow(t, FLOW_STEPUP)
+    execs[FLOW_LEVEL] = build_level_flow(t)
     return execs
+
+
+def build_level_flow(t):
+    """A step-up flow built from scratch:
+
+        e2e-level
+        |- Cookie                                   ALTERNATIVE
+        `- login (sub-flow)                         ALTERNATIVE
+           |- first (sub-flow)                      REQUIRED
+           |  |- password (sub-flow)                ALTERNATIVE
+           |  |  `- Username Password Form          REQUIRED
+           |  `- SIT: Kerberos (level from ticket)  ALTERNATIVE  indicators=pkinit, 2/1
+           `- otp (sub-flow)                        CONDITIONAL
+              |- Condition - Current LOA below 2    REQUIRED
+              `- OTP Form                           REQUIRED
+    """
+    r = "/admin/realms/" + REALM
+    api("POST", r + "/authentication/flows",
+        {"alias": FLOW_LEVEL, "providerId": "basic-flow", "topLevel": True, "builtIn": False, "description": ""}, token=t)
+
+    def executions(flow_alias):
+        execs, _ = api("GET", r + "/authentication/flows/%s/executions" % urllib.parse.quote(flow_alias), token=t)
+        return execs
+
+    def set_requirement(flow_alias, execution, requirement):
+        rep = dict(execution)
+        rep["requirement"] = requirement
+        api("PUT", r + "/authentication/flows/%s/executions" % urllib.parse.quote(flow_alias), rep, token=t)
+
+    def add_execution(flow_alias, provider, requirement, config=None):
+        api("POST", r + "/authentication/flows/%s/executions/execution" % urllib.parse.quote(flow_alias),
+            {"provider": provider}, token=t)
+        ex = [e for e in executions(flow_alias) if e.get("level", 0) == 0 and e.get("providerId") == provider][-1]
+        set_requirement(flow_alias, ex, requirement)
+        if config:
+            api("POST", r + "/authentication/executions/%s/config" % ex["id"],
+                {"alias": "%s-%s" % (flow_alias, provider), "config": config}, token=t)
+        return ex
+
+    def add_subflow(parent_alias, alias, requirement):
+        api("POST", r + "/authentication/flows/%s/executions/flow" % urllib.parse.quote(parent_alias),
+            {"alias": alias, "type": "basic-flow", "provider": "registration-page-form", "description": ""}, token=t)
+        ex = [e for e in executions(parent_alias) if e.get("level", 0) == 0 and e.get("displayName") == alias][-1]
+        set_requirement(parent_alias, ex, requirement)
+        return alias
+
+    add_execution(FLOW_LEVEL, "auth-cookie", "ALTERNATIVE")
+    login = add_subflow(FLOW_LEVEL, FLOW_LEVEL + " login", "ALTERNATIVE")
+    first = add_subflow(login, FLOW_LEVEL + " first", "REQUIRED")
+    password = add_subflow(first, FLOW_LEVEL + " password", "ALTERNATIVE")
+    add_execution(password, "auth-username-password-form", "REQUIRED")
+    level = add_execution(first, PROVIDER_LEVEL, "ALTERNATIVE", {
+        "auth.indicators": "pkinit",
+        # a dummy AMA SID: makes the authenticator parse and verify the (MIT) PAC too
+        "ama.group.sids": "S-1-5-21-1-2-3-4",
+        "level.matched": "2", "level.default": "1"})
+    otp = add_subflow(login, FLOW_LEVEL + " otp", "CONDITIONAL")
+    add_execution(otp, PROVIDER_CURRENT_LOA, "REQUIRED", {"loa-condition-level": "2"})
+    add_execution(otp, "auth-otp-form", "REQUIRED")
+    if os.environ.get("E2E_DEBUG"):
+        print("  %s: %s" % (FLOW_LEVEL, [(e.get("level"), e.get("providerId") or e.get("displayName"), e["requirement"])
+                                         for e in executions(FLOW_LEVEL)]))
+    return level["id"]
 
 
 def build_flow(t, name, provider, before_forms):
@@ -579,6 +663,58 @@ def scenario_c(exec_id):
     check("C1 built-in Kerberos via selection still ends in 'page expired'", expired)
 
 
+def login_via_button(b, exec_id):
+    """Button click through to the response after the ticket: (status, headers, body)."""
+    action = open_login_and_select(b, exec_id)
+    status, headers, _, _ = b.request("POST", action, data={"authenticationExecution": exec_id})
+    if status != 303:
+        raise RuntimeError("HTTP %d instead of 303" % status)
+    refresh = headers["location"]
+    status, _, _, _ = b.request("GET", refresh)
+    if status != 401:
+        raise RuntimeError("HTTP %d instead of 401 Negotiate" % status)
+    status, headers, body, _ = b.request("GET", refresh, negotiate=True)
+    return status, headers, body
+
+
+def scenario_d(exec_id):
+    if not pkinit_available():
+        print("SKIP  D PKINIT certificates not found in %s" % PKINIT_DIR)
+        return
+
+    def pkinit_login():
+        kinit_pkinit()
+        b = Browser()
+        status, headers, body = login_via_button(b, exec_id)
+        if status != 302:
+            raise RuntimeError("HTTP %d after the PKINIT ticket (body: %s)" % (status, re.sub(r"\s+", " ", body)[:300]))
+        loc = headers.get("location", "")
+        if not loc.startswith(REDIRECT_URI) or "code=" not in loc:
+            raise RuntimeError("expected the client redirect (OTP skipped), got " + loc)
+        code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
+        tok, _ = api("POST", "/realms/%s/protocol/openid-connect/token" % REALM, form={
+            "grant_type": "authorization_code", "client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI, "code": code})
+        payload = tok["access_token"].split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(__import__("base64").urlsafe_b64decode(payload))
+        if claims.get("acr") != "silver":
+            raise RuntimeError("acr claim %r, expected silver" % claims.get("acr"))
+        return "PKINIT ticket -> level 2, OTP skipped, acr=silver"
+    check("D1 PKINIT ticket logs in at level 2 without OTP", pkinit_login)
+
+    def password_login():
+        kinit()
+        b = Browser()
+        status, headers, body = login_via_button(b, exec_id)
+        loc = headers.get("location", "")
+        if status != 302 or "required-action" not in loc or "CONFIGURE_TOTP" not in loc:
+            raise RuntimeError("expected the OTP step (CONFIGURE_TOTP required action), got HTTP %d %s (body: %s)"
+                               % (status, loc, re.sub(r"\s+", " ", body)[:200]))
+        return "password ticket -> level 1, OTP step entered"
+    check("D2 password ticket logs in at level 1 and runs into OTP", password_login)
+    kdestroy()
+
+
 def main():
     t = admin_token()
     execs = setup_realm(t)
@@ -599,6 +735,9 @@ def main():
 
     bind_flow(t, FLOW_BUILTIN)
     scenario_c(execs[FLOW_BUILTIN])
+
+    bind_flow(t, FLOW_LEVEL)
+    scenario_d(execs[FLOW_LEVEL])
 
     kdestroy()
     print()

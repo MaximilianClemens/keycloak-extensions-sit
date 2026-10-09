@@ -6,7 +6,7 @@
 
     <groupId>io.github.sit.keycloak</groupId>
     <artifactId>keycloak-extensions-sit</artifactId>
-    <version>1.6.0</version>
+    <version>1.7.0</version>
     <packaging>jar</packaging>
 
     <name>keycloak-extensions-sit</name>
@@ -62,6 +62,19 @@
         <dependency>
             <groupId>org.keycloak</groupId>
             <artifactId>keycloak-core</artifactId>
+            <version>${keycloak.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Kerberos/LDAP federation: config classes and the SPNEGO authenticator we extend -->
+        <dependency>
+            <groupId>org.keycloak</groupId>
+            <artifactId>keycloak-kerberos-federation</artifactId>
+            <version>${keycloak.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.keycloak</groupId>
+            <artifactId>keycloak-ldap-federation</artifactId>
             <version>${keycloak.version}</version>
             <scope>provided</scope>
         </dependency>

@@ -112,7 +112,7 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
             // The browser answered our challenge. Validate like the built-in authenticator.
             logger.trace("Authorization header present after a button click, validating SPNEGO token");
             authSession.removeAuthNote(REQUESTED_NOTE);
-            super.authenticate(context);
+            authenticateWithToken(context, authHeader);
             if (context.getStatus() == FlowStatus.FAILED || context.getStatus() == FlowStatus.ATTEMPTED) {
                 // Siblings were skipped for this attempt; without a reset the flow would have
                 // nothing left to offer. Back to the password form instead.
@@ -158,6 +158,15 @@ public class SpnegoButtonAuthenticator extends SpnegoAuthenticator {
         // Reached without a request (e.g. placed before the form): stay silent.
         logger.trace("Kerberos not requested, skipping");
         context.attempted();
+    }
+
+    /**
+     * Validates the {@code Authorization} header the browser sent in reply to the challenge.
+     * The default is the built-in behaviour ({@link SpnegoAuthenticator#authenticate});
+     * subclasses can look at the ticket in more detail.
+     */
+    protected void authenticateWithToken(AuthenticationFlowContext context, String authHeader) {
+        super.authenticate(context);
     }
 
     @Override
