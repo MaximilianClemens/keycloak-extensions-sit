@@ -13,6 +13,7 @@ Built with Claude.
 | `sit-enforce-broker-acr` | SIT: Enforce Broker ACR (Post-Broker) | Post Broker Login | Reads the ACR actually reached at the upstream IdP from the validated ID token, writes it into the session (AcrStore), and optionally rejects logins that fall below the client's required level. Fixes [Keycloak #25335](https://github.com/keycloak/keycloak/issues/25335). |
 | `sit-conditional-requested-loa` | Condition - Requested LOA (SIT) | Conditional | Matches on the LOA level **requested** by the client (not what has already been satisfied). Supports `equals`, `minimum`, and `maximum` operators, allowing step-up tiers to be made mutually exclusive by requested level. |
 | `sit-auth-otp-form-no-setup` | SIT: OTP Form (no self-setup) | Browser Flow | The built-in OTP Form without the fallback to OTP self-enrolment. A user without an OTP credential is not sent to *Configure OTP*; with requirement `REQUIRED` the login fails with `credentialSetupRequired` instead. For flows where OTP is provisioned by admins or an upstream process only. |
+| `sit-auth-username-password-form` | SIT: Username Password Form (alternative allowed) | Browser Flow | The built-in Username Password Form with `ALTERNATIVE` as an additional requirement choice, so it can sit next to other first-factor options (Kerberos, passkey, IdP) without a wrapper sub-flow. As `REQUIRED` identical to the built-in form. |
 
 ### Protocol Mappers
 
@@ -153,6 +154,47 @@ OTP credentials have to be created by some other route: an admin via the account
 console, a one-time onboarding flow that still uses the built-in form, or the required action
 assigned explicitly to the user. Both authenticators can be used side by side in different
 flows; the credential is identical.
+
+---
+
+## Username Password Form as alternative (`sit-auth-username-password-form`)
+
+The built-in *Username Password Form* (`auth-username-password-form`) only offers `REQUIRED`.
+To make it one of several first-factor options it has to be wrapped in a sub-flow of its own,
+which exists only to carry the requirement:
+
+```
+First factor (sub-flow)          REQUIRED
+├─ Password (sub-flow)           ALTERNATIVE   ← wrapper
+│  └─ Username Password Form     REQUIRED
+└─ Passkey / Kerberos / …        ALTERNATIVE
+```
+
+`UsernamePasswordFormAlternativeFactory` extends the built-in factory and adds `ALTERNATIVE`
+(and `DISABLED`) to the requirement choices. Everything else is inherited: the authenticator
+is the built-in `UsernamePasswordForm`, same template, reference category `password`, optional
+passkey category for conditional UI, brute-force handling. The wrapper goes away:
+
+```
+First factor (sub-flow)              REQUIRED
+├─ SIT: Username Password Form       ALTERNATIVE
+└─ Passkey / Kerberos / …            ALTERNATIVE
+```
+
+Put the form first among the alternatives: the first one is what the login page shows. The
+others are offered under *Try another way*. Keycloak derives the texts on that page from the
+provider id (`<id>-display-name`, `<id>-help-text`); they ship in this jar under
+`theme-resources/messages` (English, German), so no theme change is needed.
+
+Keep in mind that `REQUIRED`/`CONDITIONAL` and `ALTERNATIVE` executions on the same level do
+not mix (Keycloak then ignores the alternatives). Steps that follow the first factor, such as a
+conditional OTP sub-flow, belong one level up, next to the first-factor sub-flow.
+
+`ci/login-e2e/run.sh` (workflow `login-e2e.yml`) checks this against the real Keycloak
+distribution: as `ALTERNATIVE` the form is shown first, *Try another way* lists it next to the
+passkey with readable texts, a wrong password re-renders the form, the right one logs in, and a
+user with the step-up role continues into the conditional OTP sub-flow; as `REQUIRED` it logs
+in like the built-in form.
 
 ---
 
