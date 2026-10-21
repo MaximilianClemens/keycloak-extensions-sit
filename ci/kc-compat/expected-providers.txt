@@ -9,3 +9,4 @@ required-action           sit-webauthn-register-passwordless
 identity-provider-mapper  sit-oidc-group-idp-mapper
 protocol-mapper           sit-oidc-filtered-group-claim-mapper
 authenticator             sit-auth-username-password-form
+authenticator             sit-auth-spnego-button
