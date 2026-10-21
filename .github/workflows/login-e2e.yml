@@ -1,0 +1,70 @@
+# End-to-end login tests against the real Keycloak distribution with our jar, no KDC needed:
+# sit-auth-username-password-form as ALTERNATIVE (next to passkey, followed by a conditional
+# OTP sub-flow) and as REQUIRED. See ci/login-e2e/run.sh.
+name: Login e2e
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      keycloak_version:
+        description: "Keycloak version (empty = keycloak.version from pom.xml)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: Keycloak + curl
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build provider jar
+        run: mvn -B --no-transfer-progress -DskipTests package
+
+      - name: Run end-to-end test
+        env:
+          INPUT_VERSION: ${{ inputs.keycloak_version }}
+        run: |
+          set -o pipefail
+          ci/login-e2e/run.sh ${INPUT_VERSION:+"$INPUT_VERSION"} 2>&1 | tee e2e-run.log
+
+      - name: Report failures as annotations
+        if: failure()
+        run: |
+          { grep -E "^FAIL |^\[e2e\]|ERROR|Traceback|Error" e2e-run.log; echo "--- tail:"; tail -n 15 e2e-run.log; } \
+            | head -n 60 | while IFS= read -r line; do echo "::error::${line}"; done
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Login e2e"
+            echo
+            echo '```'
+            cat .login-e2e/e2e.out 2>/dev/null || echo "no output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: login-e2e
+          path: |
+            .login-e2e/e2e.out
+            .login-e2e/keycloak.log
+            e2e-run.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 30
