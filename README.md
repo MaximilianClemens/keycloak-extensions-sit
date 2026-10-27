@@ -52,6 +52,9 @@ mvn test -Dkeycloak.version=26.8.1          # local Maven/JDK 17+
 `build_jar.sh` and the image build keep using `-DskipTests`; the test code is compiled there
 but not executed.
 
+`ci/login-e2e/run.sh` and `ci/idp-mapper-e2e/run.sh` start the real Keycloak distribution with the
+jar and play logins with curl (shared runner and Python helpers in `ci/lib/`, no root, no Docker).
+
 `ci/kerberos-e2e/run.sh` goes one step further for the on-demand Kerberos authenticator: it
 sets up a throwaway MIT KDC, starts the real Keycloak distribution with the jar, configures a
 realm through the admin API and plays the login with `curl --negotiate` (ticket accepted,
@@ -75,6 +78,68 @@ as slash-separated paths (`org/team-a`).
 | Create groups that do not exist | `createMissing` | Auto-creates missing groups including intermediate parents. |
 | Remove group memberships not in claim | `removeNotListed` | Removes memberships that are not present in the claim, limited to the managed scope. |
 | Managed Group Prefix | `managedPrefix` | Limits removal to groups below this prefix. Ignored when `targetPrefix` is set. |
+
+### Sync mode: use **Force**
+
+The mapper follows Keycloak's sync mode (*Sync mode override* on the mapper, or the identity
+provider's *Sync mode* when the override is *Inherit*):
+
+| Effective sync mode | First login (user created) | Every further login |
+|---|---|---|
+| **Force** (recommended) | synced | synced |
+| Legacy | synced | synced |
+| Import | synced | **not touched** |
+
+With **Import** the memberships are only set when the brokered user is created. A group that the
+upstream IdP assigns later (e.g. by a nightly AD sync, after the user's first login) or removes
+later is never picked up. Use **Force** so that every login reflects the current claim.
+
+Also with *Import*: when the first broker login links an already existing local account instead
+of creating one, Keycloak does not call the mapper's import step, so that user gets no groups at
+all.
+
+`ci/idp-mapper-e2e/run.sh` (workflow `idp-mapper-e2e.yml`) plays this against the real Keycloak
+distribution, which brokers itself: for every sync mode a first login, a group change upstream and
+a group assigned only after the first login. It also reads the Keycloak log: one summary line per
+sync (see below) and no "does not explicitly support sync mode" warning.
+
+The mapper declares *Import*, *Legacy* and *Force* as supported. A sync mode that a future Keycloak
+release adds is deliberately **not** claimed until its semantics have been checked: Keycloak then
+logs its "does not explicitly support sync mode" warning, and the unit test
+`everyKeycloakSyncModeHasBeenReviewed` fails on the new release.
+
+> Up to 1.7.0 the mapper also implemented `preprocessFederatedIdentity` as a "fallback" sync on
+> every login. It looked the user up by `BrokeredIdentityContext#getBrokerUserId()`
+> (`<alias>.<sub>`), while Keycloak stores the plain `sub` in the federated identity link, so the
+> lookup never found a user and the method never did anything. 1.7.1 removes it; the behaviour is
+> unchanged (verified with the e2e test against the old and the new jar).
+
+### Logging
+
+Each sync writes **one** summary line:
+
+```
+IdpGroupMapper: user=jane.doe@example.org idp=upstream mapper=sso-groups added=[SSO/ORG/team-a] removed=[] skipped=[] notFound=[] created=[]
+```
+
+| Level | When |
+|---|---|
+| WARN | `notFound` is not empty: claimed groups do not exist here and were not created (`createMissing` off), usually a configuration problem |
+| INFO | something changed: `added`, `removed`, `skipped` or `created` is not empty |
+| DEBUG | nothing changed. With sync mode *Force* this is most logins, so an unchanged sync does not cost an INFO line |
+
+| Field | Meaning |
+|---|---|
+| `added` / `removed` | memberships joined / left in this sync |
+| `skipped` | groups with admin roles not joined because the IdP does not allow admin role mapping |
+| `notFound` | claimed groups that do not exist here and were not created (`createMissing` off) |
+| `created` | groups created on the way (`createMissing` on) |
+
+On INFO the server log therefore shows every membership change made by the mapper (Keycloak
+creates no admin events for group changes made by mappers, neither for this one nor for the
+built-in ones). To see every sync, including the unchanged ones, and the per-group details, run
+the mapper's logger on DEBUG: `--log-level=info,nrw.sit.keycloak.mapper:debug`. No summary line
+at all on DEBUG means the mapper did not run a sync (e.g. sync mode *Import* on a further login).
 
 ### Stripping multiple prefixes
 
@@ -544,6 +609,7 @@ explicit versions) to check it again.
 | Start Keycloak with the **rebuilt** jar | same as above |
 | Kerberos e2e (`ci/kerberos-e2e`) with the rebuilt jar | the on-demand Kerberos login no longer works as expected (flow-engine behaviour changed) |
 | Login e2e (`ci/login-e2e`) with the rebuilt jar | `sit-auth-username-password-form` no longer behaves like the built-in form |
+| IdP mapper e2e (`ci/idp-mapper-e2e`) with the rebuilt jar | `sit-oidc-group-idp-mapper` no longer syncs according to the sync mode |
 
 For every changed Keycloak class the report shows which of our classes are affected (including the
 inheritance chain), the API changes as Java signatures, the source diff and the upstream commits

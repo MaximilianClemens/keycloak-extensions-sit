@@ -10,6 +10,7 @@ import org.keycloak.models.GroupModel;
 import org.keycloak.models.IdentityProviderMapperModel;
 import org.keycloak.models.IdentityProviderModel;
 import org.keycloak.models.IdentityProviderStorageProvider;
+import org.keycloak.models.IdentityProviderSyncMode;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.RoleModel;
@@ -17,13 +18,18 @@ import org.keycloak.models.UserModel;
 import org.keycloak.representations.JsonWebToken;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
 import java.util.stream.Stream;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -33,7 +39,9 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -68,6 +76,7 @@ class IdpGroupMapperSyncTest {
         realm = mock(RealmModel.class);
         when(realm.getName()).thenReturn("test");
         when(realm.getGroupsStream()).thenAnswer(inv -> new ArrayList<>(children.keySet()).stream());
+        when(realm.getTopLevelGroupsStream()).thenAnswer(inv -> new ArrayList<>(topLevel).stream());
         when(realm.getGroupById(anyString())).thenAnswer(inv -> children.keySet().stream()
                 .filter(g -> inv.getArgument(0).equals(g.getId()))
                 .findFirst().orElse(null));
@@ -351,6 +360,145 @@ class IdpGroupMapperSyncTest {
         verify(session, never()).identityProviders();
     }
 
+    // ── sync modes ───────────────────────────────────────────────────────────
+
+    @Test
+    void supportsImportLegacyAndForce() {
+        assertTrue(mapper.supportsSyncMode(IdentityProviderSyncMode.IMPORT));
+        assertTrue(mapper.supportsSyncMode(IdentityProviderSyncMode.LEGACY));
+        assertTrue(mapper.supportsSyncMode(IdentityProviderSyncMode.FORCE));
+        assertFalse(mapper.supportsSyncMode(null));
+    }
+
+    /**
+     * Guard for Keycloak upgrades: a new sync mode is not supported until someone has checked
+     * what it means for this mapper and added it to {@link IdpGroupMapper#SUPPORTED_SYNC_MODES}.
+     */
+    @Test
+    void everyKeycloakSyncModeHasBeenReviewed() {
+        assertEquals(EnumSet.allOf(IdentityProviderSyncMode.class), IdpGroupMapper.SUPPORTED_SYNC_MODES,
+                "IdentityProviderSyncMode gained a value: decide whether the mapper supports it");
+    }
+
+    @Test
+    void sharedParentsAreResolvedOncePerSync() {
+        GroupModel sso = group("SSO", null);
+        GroupModel org = group("ORG", sso);
+        group("team-a", org);
+        group("team-b", org);
+        group("team-c", org);
+
+        sync(claim("/SSO/ORG/team-a", "/SSO/ORG/team-b", "/SSO/ORG/team-c"),
+                IdpGroupMapper.GROUP_PREFIX, "/SSO/ORG",
+                IdpGroupMapper.TARGET_PREFIX, "/SSO/ORG");
+
+        assertTrue(isMember("SSO/ORG/team-a"));
+        assertTrue(isMember("SSO/ORG/team-b"));
+        assertTrue(isMember("SSO/ORG/team-c"));
+        // "SSO" and "SSO/ORG" are shared by all three claimed groups: one lookup each, not three
+        verify(realm, times(1)).getTopLevelGroupsStream();
+        verify(sso, times(1)).getSubGroupsStream();
+        verify(org, times(3)).getSubGroupsStream();
+        verify(realm, never()).getGroupsStream();
+    }
+
+    @Test
+    void relativeTargetPrefixStillScansAllGroups() {
+        GroupModel probe = group("Probe", null);
+        GroupModel nestedSso = group("SSO", probe);
+        group("x", nestedSso);
+
+        sync(claim("x"), IdpGroupMapper.TARGET_PREFIX, "SSO");
+
+        assertTrue(isMember("Probe/SSO/x"));
+        verify(realm, never()).getTopLevelGroupsStream();
+    }
+
+    @Test
+    void updateBrokeredUserSyncsLikeImportNewUser() {
+        GroupModel kc2 = group("KC2", null);
+        GroupModel old = group("old", kc2);
+        group("new", kc2);
+        memberships.add(old);
+
+        IdentityProviderMapperModel model = model(IdpGroupMapper.TARGET_PREFIX, "KC2",
+                IdpGroupMapper.REMOVE_NOT_LISTED, "true");
+        mapper.updateBrokeredUser(session, realm, user, model, claim("new"));
+
+        assertTrue(isMember("KC2/new"));
+        assertFalse(isMember("KC2/old"));
+    }
+
+    @Test
+    void preprocessFederatedIdentityDoesNothing() {
+        // the inherited no-op: groups are only synced via importNewUser / updateBrokeredUser
+        group("users", null);
+        IdentityProviderMapperModel model = model();
+        mapper.preprocessFederatedIdentity(session, realm, model, claim("users"));
+
+        verifyNoInteractions(session, realm, user);
+    }
+
+    // ── summary log line ─────────────────────────────────────────────────────
+    // jboss-logging has no backend on the test classpath and falls back to java.util.logging,
+    // so the summary can be captured there (DEBUG -> FINE, WARN -> WARNING).
+
+    @Test
+    void unchangedSyncLogsSummaryOnDebugOnly() {
+        GroupModel users = group("users", null);
+        memberships.add(users);
+
+        List<LogRecord> records = capture(() -> sync(claim("users")));
+
+        assertEquals(1, records.size(), records.toString());
+        assertEquals(Level.FINE, records.get(0).getLevel());
+        assertTrue(records.get(0).getMessage().startsWith("IdpGroupMapper: user=alice idp=upstream mapper=groups "));
+    }
+
+    @Test
+    void changedSyncLogsSummaryOnInfo() {
+        group("users", null);
+
+        List<LogRecord> records = capture(() -> sync(claim("users")));
+
+        assertEquals(1, records.size(), records.toString());
+        assertEquals(Level.INFO, records.get(0).getLevel());
+        assertTrue(records.get(0).getMessage().contains("added=[users]"));
+    }
+
+    @Test
+    void unresolvedGroupLogsSummaryOnWarn() {
+        List<LogRecord> records = capture(() -> sync(claim("nope")));
+
+        assertEquals(1, records.size(), records.toString());
+        assertEquals(Level.WARNING, records.get(0).getLevel());
+        assertTrue(records.get(0).getMessage().contains("notFound=[nope]"));
+    }
+
+    /** Runs the action and returns the summary lines the mapper logged, at any level. */
+    private static List<LogRecord> capture(Runnable action) {
+        java.util.logging.Logger jul = java.util.logging.Logger.getLogger(IdpGroupMapper.class.getName());
+        List<LogRecord> records = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override public void publish(LogRecord r) {
+                if (r.getMessage() != null && r.getMessage().startsWith("IdpGroupMapper: user=")
+                        && r.getMessage().contains(" idp=")) records.add(r);
+            }
+            @Override public void flush() {}
+            @Override public void close() {}
+        };
+        Level before = jul.getLevel();
+        jul.setLevel(Level.ALL);
+        jul.addHandler(handler);
+        try {
+            action.run();
+        } finally {
+            jul.removeHandler(handler);
+            jul.setLevel(before);
+        }
+        return records;
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /** Maps the realm-management role "manage-users" to the group. */
@@ -365,6 +513,10 @@ class IdpGroupMapperSyncTest {
     }
 
     private void sync(BrokeredIdentityContext ctx, String... configKeyValues) {
+        mapper.importNewUser(session, realm, user, model(configKeyValues), ctx);
+    }
+
+    private static IdentityProviderMapperModel model(String... configKeyValues) {
         Map<String, String> config = new HashMap<>();
         for (int i = 0; i < configKeyValues.length; i += 2) {
             config.put(configKeyValues[i], configKeyValues[i + 1]);
@@ -373,7 +525,7 @@ class IdpGroupMapperSyncTest {
         model.setConfig(config);
         model.setName("groups");
         model.setIdentityProviderAlias("upstream");
-        mapper.importNewUser(session, realm, user, model, ctx);
+        return model;
     }
 
     /** Builds a brokered context whose validated ID token carries the given "groups" claim. */
