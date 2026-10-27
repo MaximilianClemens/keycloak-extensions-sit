@@ -6,15 +6,15 @@
 
     <groupId>io.github.sit.keycloak</groupId>
     <artifactId>keycloak-extensions-sit</artifactId>
-    <version>1.7.1</version>
+    <version>1.8.0</version>
     <packaging>jar</packaging>
 
     <name>keycloak-extensions-sit</name>
     <description>
         Keycloak SPI extensions by Südwestfalen-IT (SIT):
         ACR/LoA broker forwarding and enforcement, conditional LOA authenticator,
-        filtered group claim mapper, IdP group mapper, an on-demand (button) Kerberos/SPNEGO
-        authenticator and a WebAuthn passwordless registration action that tolerates a
+        filtered group claim mapper, IdP group mapper, Kerberos/SPNEGO as a choice on the login page
+        (ticket endpoint + authenticator, plus the deprecated button variant) and a WebAuthn passwordless registration action that tolerates a
         missing attestation statement.
     </description>
     <url>https://github.com/SIT-NRW/keycloak-extensions-sit</url>

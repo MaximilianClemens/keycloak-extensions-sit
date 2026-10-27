@@ -1,4 +1,4 @@
-# End-to-end test of the on-demand Kerberos authenticator (sit-auth-spnego-button):
+# End-to-end test of the Kerberos authenticators (sit-auth-spnego-button, sit-auth-kerberos-ticket):
 # throwaway MIT KDC on the runner, the real Keycloak distribution with our jar, the login
 # played with curl --negotiate. See ci/kerberos-e2e/run.sh.
 name: Kerberos e2e

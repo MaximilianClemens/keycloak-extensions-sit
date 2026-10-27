@@ -4,3 +4,4 @@ nrw.sit.keycloak.authenticator.RequestedLoaConditionalAuthenticatorFactory
 nrw.sit.keycloak.authenticator.OtpFormNoSetupAuthenticatorFactory
 nrw.sit.keycloak.authenticator.UsernamePasswordFormAlternativeFactory
 nrw.sit.keycloak.authenticator.SpnegoButtonAuthenticatorFactory
+nrw.sit.keycloak.authenticator.KerberosTicketAuthenticatorFactory

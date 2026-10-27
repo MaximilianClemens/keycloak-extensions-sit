@@ -5,6 +5,7 @@ import org.keycloak.authentication.AuthenticatorFactory;
 import org.keycloak.authentication.RequiredActionFactory;
 import org.keycloak.broker.provider.IdentityProviderMapper;
 import org.keycloak.protocol.ProtocolMapper;
+import org.keycloak.services.resource.RealmResourceProviderFactory;
 import org.keycloak.provider.ProviderFactory;
 
 import java.io.IOException;
@@ -29,7 +30,7 @@ class ServiceRegistrationTest {
 
     @Test
     void authenticatorFactories() throws Exception {
-        assertRegistered(AuthenticatorFactory.class, 6);
+        assertRegistered(AuthenticatorFactory.class, 7);
     }
 
     @Test
@@ -45,6 +46,11 @@ class ServiceRegistrationTest {
     @Test
     void protocolMappers() throws Exception {
         assertRegistered(ProtocolMapper.class, 1);
+    }
+
+    @Test
+    void realmResourceProviderFactories() throws Exception {
+        assertRegistered(RealmResourceProviderFactory.class, 1);
     }
 
     private static void assertRegistered(Class<? extends ProviderFactory<?>> spi, int expectedCount) throws Exception {

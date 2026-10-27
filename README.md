@@ -14,7 +14,8 @@ Built with Claude.
 | `sit-conditional-requested-loa` | Condition - Requested LOA (SIT) | Conditional | Matches on the LOA level **requested** by the client (not what has already been satisfied). Supports `equals`, `minimum`, and `maximum` operators, allowing step-up tiers to be made mutually exclusive by requested level. |
 | `sit-auth-otp-form-no-setup` | SIT: OTP Form (no self-setup) | Browser Flow | The built-in OTP Form without the fallback to OTP self-enrolment. A user without an OTP credential is not sent to *Configure OTP*; with requirement `REQUIRED` the login fails with `credentialSetupRequired` instead. For flows where OTP is provisioned by admins or an upstream process only. |
 | `sit-auth-username-password-form` | SIT: Username Password Form (alternative allowed) | Browser Flow | The built-in Username Password Form with `ALTERNATIVE` as an additional requirement choice, so it can sit next to other first-factor options (Kerberos, passkey, IdP) without a wrapper sub-flow. As `REQUIRED` identical to the built-in form. |
-| `sit-auth-spnego-button` | SIT: Kerberos (on demand) | Browser Flow | Kerberos/SPNEGO that the user starts from the login page (a "Sign in with Windows" button) instead of running automatically. Works around the built-in authenticator ending in *page expired* when chosen via *Try another way*. `ALTERNATIVE`, placed after the forms sub-flow. Verified end-to-end against a real KDC in CI. |
+| `sit-auth-kerberos-ticket` | SIT: Kerberos (ticket checked by the login page) | Browser Flow | Kerberos as a choice on the login page **without touching the flow engine**: the page validates the ticket at the realm endpoint `/sit-kerberos/ticket` (`fetch`, browser handles `Negotiate`), then selects this execution, which only consumes the result. Ships `sit-kerberos-ticket.ftl` and the `sit-kerberos` REST extension. Replaces `sit-auth-spnego-button`. |
+| `sit-auth-spnego-button` *(deprecated, use `sit-auth-kerberos-ticket`)* | SIT: Kerberos (on demand) | Browser Flow | Kerberos/SPNEGO that the user starts from the login page (a "Sign in with Windows" button) instead of running automatically. Works around the built-in authenticator ending in *page expired* when chosen via *Try another way*. `ALTERNATIVE`, placed after the forms sub-flow. Verified end-to-end against a real KDC in CI. |
 
 ### Protocol Mappers
 
@@ -55,11 +56,11 @@ but not executed.
 `ci/login-e2e/run.sh` and `ci/idp-mapper-e2e/run.sh` start the real Keycloak distribution with the
 jar and play logins with curl (shared runner and Python helpers in `ci/lib/`, no root, no Docker).
 
-`ci/kerberos-e2e/run.sh` goes one step further for the on-demand Kerberos authenticator: it
+`ci/kerberos-e2e/run.sh` goes one step further for the Kerberos authenticators: it
 sets up a throwaway MIT KDC, starts the real Keycloak distribution with the jar, configures a
-realm through the admin API and plays the login with `curl --negotiate` (ticket accepted,
-fallback without ticket, and the upstream "page expired" behaviour of the built-in
-authenticator). `.github/workflows/kerberos-e2e.yml` runs it on every push. Needs root
+realm through the admin API and plays the logins with `curl --negotiate` (ticket endpoint and
+selection of `sit-auth-kerberos-ticket`, step-up after it; button with and without ticket; and
+the upstream "page expired" behaviour of the built-in authenticator). `.github/workflows/kerberos-e2e.yml` runs it on every push. Needs root
 (KDC, `/etc/hosts`), so it is meant for CI runners or throwaway VMs.
 
 ---
@@ -292,7 +293,142 @@ in like the built-in form.
 
 ---
 
+## Kerberos via the login page (`sit-auth-kerberos-ticket`)
+
+Kerberos as a *choice* on the login page (a "Sign in with Windows" button, or a silent probe
+on page load), next to password and passkey, for platforms where only some users sit on a
+domain-joined machine. Unlike `sit-auth-spnego-button` below, nothing in the flow engine is
+touched: no flow reset, no execution statuses, no redirect detour, no subclass of a Keycloak
+authenticator.
+
+### Idea
+
+The "page expired" problem of Kerberos behind *Try another way* exists only because the
+selected authenticator answers the selection `POST` with a `401` challenge, which the browser
+then has to repeat. So the challenge is taken out of the flow: the login page runs the SPNEGO
+round trip itself, against a small realm endpoint, **before** it selects the execution. By the
+time the ordinary selection `POST` arrives, the ticket is already validated and the execution
+simply succeeds. Keycloak continues as after any other successful alternative.
+
+```
+login page (JS, shipped template)
+  1. fetch /realms/<realm>/sit-kerberos/ticket?client_id=..&tab_id=..
+     - no Authorization header     -> 401 WWW-Authenticate: Negotiate, browser retries with the ticket
+     - Negotiate <token>           -> users().getUserByCredential(realm, kerberos(token))
+                                      (the very call the built-in auth-spnego makes: Kerberos or
+                                      LDAP-with-Kerberos user storage provider, its keytab)
+     - valid                       -> auth notes in the caller's authentication session:
+                                      sit.kerberos.ticket.user / .time / .state; 200 {"ok":true}
+     - otherwise                   -> 403 {"ok":false,"reason":..}, nothing recorded
+  2. ok -> POST url.loginAction with authenticationExecution=<this execution>
+           (the normal "try another way" selection, with Keycloak's session_code)
+
+sit-auth-kerberos-ticket (ALTERNATIVE, after the password form)
+  note present, younger than 60 s, user exists -> notes removed, setUser(), success()
+  otherwise                                    -> attempted(), password form again
+  -> Keycloak: conditional OTP, required actions, redirect to the client
+```
+
+### Flow
+
+```
+Browser flow
+├─ Cookie                                   ALTERNATIVE
+├─ Kerberos (built-in)                      DISABLED
+├─ Identity Provider Redirector             ALTERNATIVE
+├─ Forms                                    ALTERNATIVE
+│  └─ Username Password Form                REQUIRED
+└─ SIT: Kerberos (ticket checked by page)   ALTERNATIVE   ← after the forms
+```
+
+or, in the step-up layout, next to the password form inside the first-factor sub-flow:
+
+```
+Bronze/Silver                               ALTERNATIVE  (sub-flow)
+├─ Bronze                                   REQUIRED     (sub-flow)
+│  ├─ SIT: Username Password Form           ALTERNATIVE  (sit-auth-username-password-form)
+│  └─ SIT: Kerberos (ticket checked by page) ALTERNATIVE  ← after the form
+└─ Silver                                   CONDITIONAL  (condition + OTP)
+```
+
+Put the execution **after** the form it is an alternative to: the login page lists only
+executions the flow has not reached yet. Everything that follows the first factor (a
+conditional OTP sub-flow, required actions) runs after the Kerberos login exactly as after a
+password login; the e2e test covers the step-up layout. The conditional placement from the
+button section ("double wrapper") works the same way, the selection is validated by Keycloak.
+
+### Theme
+
+The jar ships the page-side part as `theme-resources/templates/sit-kerberos-ticket.ftl`, so any
+login theme can include it without copying. In `login.ftl`, for example right after the login
+`</form>`:
+
+```ftl
+<#include "sit-kerberos-ticket.ftl">
+```
+
+Two modes, chosen before the include:
+
+```ftl
+<#assign sitKerberosMode = "button">   <#-- default: button, the probe runs on click -->
+<#assign sitKerberosMode = "auto">     <#-- probe on page load; log in at once with a ticket, show nothing without -->
+```
+
+Texts are message keys and can be overridden in the theme: `sit.kerberos.button`,
+`sit.kerberos.noTicket` (shown under the button when the browser has no ticket), and the
+*Try another way* texts `sit-auth-kerberos-ticket-display-name` / `-help-text` (English and
+German ship in the jar). The template renders only when the flow offers the execution and
+needs `fetch`/`URL` (every current browser); without JavaScript the page shows the password
+form as usual.
+
+### Server configuration
+
+`--spi-authenticator-sit-auth-kerberos-ticket-max-age-seconds=<n>`: how long a validated
+ticket may wait for the selection `POST` (default 60).
+
+### Security properties
+
+- **Ticket validation is Keycloak's.** The endpoint adds no cryptography; it calls the same
+  user storage provider the built-in authenticator calls, with the same keytab.
+- **The endpoint authenticates nobody.** It records a note in the caller's authentication
+  session (cookie `AUTH_SESSION_ID` + `tab_id`). The note is worthless without the selection
+  `POST`, which carries Keycloak's single-use `session_code`; Keycloak also checks that the
+  selected execution is one of the offered alternatives.
+- **Bound, single use, short-lived.** Another browser cannot read or use the note; the
+  authenticator removes it on first use, whatever the outcome; it expires after 60 s.
+- **No anonymous GSS work.** Without an authentication session for the given client and tab the
+  endpoint answers `403` before looking at the token, so it exposes less than Keycloak's own
+  `/auth` endpoint, which accepts a SPNEGO token from anyone.
+- **Nothing is skipped.** The execution never changes execution statuses or resets the flow;
+  mandatory steps after it run as usual. A selection without a validated ticket is `attempted`
+  and lands on the password form.
+- **Same origin, `no-store`.** No CORS, no caching of challenges or results.
+
+### Dependencies on Keycloak
+
+Public SPI only (`RealmResourceProvider`, `Authenticator`, `UserProvider#getUserByCredential`,
+`CredentialValidationOutput`, auth notes) plus `AuthenticationSessionManager` from
+`keycloak-services` for the cookie lookup. The compatibility check and `ci/kerberos-e2e`
+(scenarios `T`, `TB`, `TG`) exercise the endpoint, the selection and the step-up layout
+against every new Keycloak release.
+
+### Client side
+
+Same as for the button: the browser must be willing to send a ticket to the Keycloak host
+(Windows zone *Local intranet*, or `AuthServerAllowlist` for Chrome/Edge,
+`network.negotiate-auth.trusted-uris` for Firefox), SPN and keytab for `HTTP/<keycloak-host>`.
+Negotiate on `fetch` follows the same rules as on navigation. A `403`/`401` from the endpoint
+with a domain-joined machine means the browser sent no ticket (check `chrome://net-export`).
+
+---
+
 ## Kerberos on demand (`sit-auth-spnego-button`)
+
+> **Deprecated.** Superseded by [`sit-auth-kerberos-ticket`](#kerberos-via-the-login-page-sit-auth-kerberos-ticket),
+> which achieves the same login experience without manipulating the flow engine. The button
+> stays for one more minor version so existing flows keep working; migrate by replacing the
+> execution and the theme include (`sit-kerberos-button.ftl` → `sit-kerberos-ticket.ftl`).
+
 
 The built-in *Kerberos* authenticator (`auth-spnego`) challenges on the first request it sees.
 In a multi-tenant platform where only some users sit on a domain-joined machine, that means a
@@ -584,6 +720,7 @@ RUN /opt/keycloak/bin/kc.sh build
 
 | Extension version | Keycloak |
 |---|---|
+| 1.8.x | ≥ 26.8 (adds `sit-auth-kerberos-ticket` + `sit-kerberos` endpoint) |
 | 1.7.x | ≥ 26.8 (uses the IdP admin role mapping check introduced in 26.8.0) |
 | 1.0 – 1.6 | ≥ 24 (tested against 26.x up to 26.7) |
 

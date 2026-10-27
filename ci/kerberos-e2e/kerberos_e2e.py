@@ -21,6 +21,15 @@ public client) and then plays the login the way a browser does, with curl:
      (documents the Keycloak behaviour this provider works around; if this check ever
      fails, Keycloak fixed it upstream and the provider may be retired)
 
+and for sit-auth-kerberos-ticket (ticket checked by the login page, no flow manipulation):
+
+  T. kinit alice -> login page lists the execution -> GET /sit-kerberos/ticket without header
+     -> 401 Negotiate; with a wrong tab or without cookies -> 403 (ticket never evaluated);
+     with the ticket -> 200 {"ok":true} -> ordinary selection POST -> 302 with an
+     authorization code at once (no 303, no challenge) -> token says preferred_username=alice
+  TB. no ticket -> the endpoint ends in 401 -> selection POST -> password form (attempted)
+  TG. step-up layout with the ticket execution: after the ticket the silver OTP step follows
+
 Usage: kerberos_e2e.py <base-url> <keytab>
 The base URL must use the host of the service principal (http://keycloak.example.test:8080).
 Exit code 0 = all checks passed. Output: one line per check (OK/FAIL).
@@ -47,7 +56,10 @@ FLOW_BUTTON = "e2e-browser-button"
 FLOW_BUILTIN = "e2e-browser-builtin"
 FLOW_NESTED = "e2e-browser-nested"
 FLOW_STEPUP = "e2e-browser-stepup"
+FLOW_TICKET = "e2e-browser-ticket"
+FLOW_TICKET_STEPUP = "e2e-browser-ticket-stepup"
 PROVIDER_BUTTON = "sit-auth-spnego-button"
+PROVIDER_TICKET = "sit-auth-kerberos-ticket"
 PROVIDER_BUILTIN = "auth-spnego"
 
 failures = []
@@ -199,6 +211,8 @@ def setup_realm(t):
     execs[FLOW_BUILTIN] = build_flow(t, FLOW_BUILTIN, PROVIDER_BUILTIN, before_forms=False)
     execs[FLOW_NESTED] = build_nested_flow(t, FLOW_NESTED)
     execs[FLOW_STEPUP] = build_stepup_flow(t, FLOW_STEPUP)
+    execs[FLOW_TICKET] = build_flow(t, FLOW_TICKET, PROVIDER_TICKET, before_forms=False)
+    execs[FLOW_TICKET_STEPUP] = build_stepup_flow(t, FLOW_TICKET_STEPUP, PROVIDER_TICKET)
     return execs
 
 
@@ -306,18 +320,18 @@ def build_nested_flow(t, name):
     return by_provider(PROVIDER_BUTTON)["id"], config_id
 
 
-def build_stepup_flow(t, name):
+def build_stepup_flow(t, name, provider=PROVIDER_BUTTON):
     """The SIT layout, built from scratch:
          <name>                         top level
          |- Cookie                      ALTERNATIVE
          `- bronze/silver (sub-flow)    ALTERNATIVE
             |- bronze (sub-flow)        REQUIRED
             |  |- password (sub-flow)   ALTERNATIVE > Username Password Form REQUIRED
-            |  `- button                ALTERNATIVE
+            |  `- <provider>            ALTERNATIVE   (button or ticket execution)
             `- silver (sub-flow)        CONDITIONAL
                |- client-scope condition (true, stands in for "requested ACR")
                `- OTP Form              REQUIRED
-    Returns the button execution id."""
+    Returns the Kerberos execution id."""
     r = "/admin/realms/" + REALM
     q = urllib.parse.quote
     api("POST", r + "/authentication/flows",
@@ -353,7 +367,7 @@ def build_stepup_flow(t, name):
     bronze = add_subflow(login, name + " bronze", "REQUIRED")
     password = add_subflow(bronze, name + " password", "ALTERNATIVE")
     add_execution(password, "auth-username-password-form", "REQUIRED")
-    button = add_execution(bronze, PROVIDER_BUTTON, "ALTERNATIVE")
+    button = add_execution(bronze, provider, "ALTERNATIVE")
     silver = add_subflow(login, name + " silver", "CONDITIONAL")
     add_execution(silver, "conditional-client-scope", "REQUIRED", {"client_scope": "profile", "negate": "false"})
     add_execution(silver, "auth-otp-form", "REQUIRED")
@@ -560,6 +574,143 @@ def scenario_g(exec_id):
     check("G1 step-up: after Kerberos the silver OTP step follows", otp_follows)
 
 
+def ticket_endpoint(action, tab_id=None):
+    """What the page-side script derives from url.loginAction: the realm's ticket endpoint with
+    the client_id and tab_id of the current login."""
+    u = urllib.parse.urlparse(action)
+    q = urllib.parse.parse_qs(u.query)
+    path = re.sub(r"/login-actions/.*$", "/sit-kerberos/ticket", u.path)
+    params = {"client_id": q["client_id"][0], "tab_id": tab_id or q["tab_id"][0]}
+    return urllib.parse.urlunparse(u._replace(path=path, query=urllib.parse.urlencode(params)))
+
+
+def ticket_json(body):
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise RuntimeError("endpoint did not answer with JSON: %s" % body[:200])
+
+
+def scenario_t(exec_id, p="T"):
+    """sit-auth-kerberos-ticket with a ticket: the page validates it at the endpoint, then the
+    ordinary selection logs in at once."""
+    kinit()
+    b = Browser()
+    state = {}
+
+    def offered():
+        state["action"] = open_login_and_select(b, exec_id)
+        state["endpoint"] = ticket_endpoint(state["action"])
+        return "listed in authenticationSelections"
+    if not check(p + "1 execution offered on the login page", offered):
+        return
+
+    def challenge():
+        status, headers, body, _ = b.request("GET", state["endpoint"])
+        if status != 401 or headers.get("www-authenticate", "").lower() != "negotiate":
+            raise RuntimeError("HTTP %d / WWW-Authenticate: %s" % (status, headers.get("www-authenticate")))
+        if ticket_json(body).get("reason") != "negotiate":
+            raise RuntimeError("unexpected body %s" % body[:200])
+        if "no-store" not in headers.get("cache-control", ""):
+            raise RuntimeError("missing Cache-Control: no-store")
+        return "401 WWW-Authenticate: Negotiate, JSON body"
+    if not check(p + "2 endpoint without header challenges with Negotiate", challenge):
+        return
+
+    def wrong_tab():
+        status, _, body, _ = b.request("GET", ticket_endpoint(state["action"], tab_id="bogus"), negotiate=True)
+        if status != 403 or ticket_json(body).get("reason") != "no_auth_session":
+            raise RuntimeError("HTTP %d %s" % (status, body[:200]))
+        status, _, body, _ = Browser().request("GET", state["endpoint"], negotiate=True)
+        if status != 403 or ticket_json(body).get("reason") != "no_auth_session":
+            raise RuntimeError("without cookies: HTTP %d %s" % (status, body[:200]))
+        return "403 no_auth_session for a wrong tab and for a caller without cookies"
+    if not check(p + "3 a token is only accepted for the caller's own login", wrong_tab):
+        return
+
+    def accepted():
+        status, _, body, statuses = b.request("GET", state["endpoint"], negotiate=True)
+        if status != 200 or ticket_json(body).get("ok") is not True:
+            raise RuntimeError("HTTP %d %s" % (status, body[:200]))
+        return "200 {\"ok\":true} (rounds: %s)" % statuses
+    if not check(p + "4 endpoint accepts the ticket", accepted):
+        return
+
+    def selection():
+        status, headers, body, _ = b.request("POST", state["action"], data={"authenticationExecution": exec_id})
+        if status != 302:
+            raise RuntimeError("HTTP %d instead of 302 to the client (body: %s)" % (status, re.sub(r"\s+", " ", body)[:300]))
+        loc = headers.get("location", "")
+        if not loc.startswith(REDIRECT_URI) or "code=" not in loc:
+            raise RuntimeError("unexpected Location " + loc)
+        if headers.get("www-authenticate"):
+            raise RuntimeError("selection answered with a challenge")
+        state["code"] = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
+        return "selection POST -> 302 with authorization code, no challenge, no redirect detour"
+    if not check(p + "5 the ordinary selection logs in at once", selection):
+        return
+
+    def token():
+        tok, _ = api("POST", "/realms/%s/protocol/openid-connect/token" % REALM, form={
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI, "code": state["code"]})
+        payload = tok["access_token"].split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(__import__("base64").urlsafe_b64decode(payload))
+        if claims.get("preferred_username") != "alice":
+            raise RuntimeError("token for %r, expected alice" % claims.get("preferred_username"))
+        return "preferred_username=alice"
+    check(p + "6 authorization code yields a token for the Kerberos user", token)
+
+
+def scenario_tb(exec_id, p="TB"):
+    """sit-auth-kerberos-ticket without a ticket: the endpoint stays at 401, a selection without
+    a validated ticket is only 'attempted' and the password form comes back."""
+    kdestroy()
+    b = Browser()
+    state = {}
+
+    def no_ticket():
+        state["action"] = open_login_and_select(b, exec_id)
+        status, headers, body, _ = b.request("GET", ticket_endpoint(state["action"]), negotiate=True)
+        if status != 401 or headers.get("www-authenticate", "").lower() != "negotiate":
+            raise RuntimeError("HTTP %d / %s" % (status, headers.get("www-authenticate")))
+        return "401 Negotiate stays, nothing recorded"
+    if not check(p + "1 endpoint without a ticket ends in 401", no_ticket):
+        return
+
+    def password_form():
+        status, headers, body, _ = b.request("POST", state["action"], data={"authenticationExecution": exec_id})
+        if status != 200 or 'id="kc-form-login"' not in body:
+            raise RuntimeError("HTTP %d, password form expected (body: %s)" % (status, re.sub(r"\s+", " ", body)[:300]))
+        if "expired" in body.lower() or headers.get("www-authenticate"):
+            raise RuntimeError("page expired or a challenge instead of the password form")
+        return "selection without validated ticket -> password form"
+    check(p + "2 selection without a validated ticket falls back to the password form", password_form)
+
+
+def scenario_tg(exec_id):
+    """Step-up layout with the ticket execution: silver (OTP) must follow the Kerberos login."""
+    kinit()
+    b = Browser()
+
+    def otp_follows():
+        action = open_login_and_select(b, exec_id)
+        status, _, body, _ = b.request("GET", ticket_endpoint(action), negotiate=True)
+        if status != 200:
+            raise RuntimeError("endpoint HTTP %d" % status)
+        status, headers, body, _ = b.request("POST", action, data={"authenticationExecution": exec_id})
+        loc = headers.get("location", "")
+        if status == 302 and loc.startswith(REDIRECT_URI):
+            raise RuntimeError("logged in without the OTP step")
+        if status == 302 and "/login-actions/" in loc:
+            status, headers, body, _ = b.request("GET", loc)
+        if status != 200 or not re.search(r'otp|totp', body, re.I):
+            raise RuntimeError("HTTP %d, OTP step expected (body: %s)" % (status, re.sub(r"\s+", " ", body)[:200]))
+        return "ticket accepted, OTP step follows (no authorization code)"
+    check("TG1 step-up: after the ticket login the silver OTP step follows", otp_follows)
+
+
 def scenario_c(exec_id):
     kinit()
     b = Browser()
@@ -596,6 +747,13 @@ def main():
 
     bind_flow(t, FLOW_STEPUP)
     scenario_g(execs[FLOW_STEPUP])
+
+    bind_flow(t, FLOW_TICKET)
+    scenario_t(execs[FLOW_TICKET])
+    scenario_tb(execs[FLOW_TICKET])
+
+    bind_flow(t, FLOW_TICKET_STEPUP)
+    scenario_tg(execs[FLOW_TICKET_STEPUP])
 
     bind_flow(t, FLOW_BUILTIN)
     scenario_c(execs[FLOW_BUILTIN])
